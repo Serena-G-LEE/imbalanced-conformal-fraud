@@ -6,31 +6,40 @@ Fraud models are usually evaluated by ranking quality (PR-AUC, ROC-AUC), but a d
 answer a different question for every transaction: approve it, block it, or spend a human reviewer on
 it. This repository converts that decision into a calibrated prediction-set problem. A
 gradient-boosted fraud model (XGBoost / LightGBM) is wrapped in split conformal prediction, every
-transaction receives a set over `{legitimate (0), fraud (1)}`, and the two calibration schemes —
-pooled standard split CP versus class-conditional (Mondrian) CP — are compared on their fraud coverage
-and on the size of the manual review queue they imply.
+transaction receives a set over `{legitimate (0), fraud (1)}`, and three calibration schemes are
+compared on their fraud coverage and on the size of the manual review queue they imply: pooled
+standard split CP, class-conditional (Mondrian) CP, and class-conditional *adaptive* CP (ACI).
 
 The central claim the code is built to test: under extreme imbalance (0.172 % positives in ULB, ≈3.5 %
 in IEEE-CIS) a pooled split keeps *marginal* coverage at `1 − α` while its *fraud* coverage collapses,
 because the pooled quantile is dominated by the legitimate class; a Mondrian split restores the
 class-conditional guarantee `P(Y ∈ C(X) | Y = y) ≥ 1 − α` and thereby makes the review workload a
-measured quantity at a chosen coverage level instead of a by-product of threshold tuning.
+measured quantity at a chosen coverage level instead of a by-product of threshold tuning. The second
+claim is that this guarantee is only as good as the window it was calibrated in: on a chronological
+test stream the score distribution moves, a static Mondrian split under-covers the minority class by
+three to four points, and letting the two class-conditional levels move online (ACI) closes most of
+that gap — at a review cost that is measured rather than assumed.
 
 ---
 
 ## Highlights
 
-- **Two calibration schemes, one interface.** `StandardSplitCP` and `MondrianCP` share the same
-  finite-sample corrected quantile and differ only in how calibration scores are stratified.
+- **Three calibration schemes, one interface.** `StandardSplitCP`, `MondrianCP` and
+  `AdaptiveMondrianCP` share the same finite-sample corrected quantile and differ only in how
+  calibration scores are stratified and whether the level is allowed to move online.
 - **Triage as a first-class output.** Prediction sets are mapped onto four operational outcomes:
   `{0}` auto-approve, `{1}` auto-decline, `{0,1}` manual review, `{}` reject / fall back.
 - **Leakage-free protocol.** Chronological `train / calibration / test` split, preprocessing fit on the
   training block only, model never sees the calibration or test window.
+- **A causal adaptive scheme.** Stage 3 updates one miscoverage level per class from labels that arrive
+  *after* the set was formed, so the drift-tracking correction never uses information a deployed
+  system would not have at decision time.
 - **Seeded multi-run reporting.** Every `(model, method, alpha)` cell is reported as mean ± standard
   deviation over five seeds, with per-seed CSVs kept for auditing.
-- **Two-stage protocol.** A stage-2 calibration ablation compares class re-weighting (`scale_pos_weight`)
-  against post-hoc probability calibration (Platt / isotonic) on a leakage-free `prob_cal` split, with
-  Brier score and expected calibration error reported next to the triage metrics.
+- **Three-stage protocol.** Stage 2 compares class re-weighting (`scale_pos_weight`) against post-hoc
+  probability calibration (Platt / isotonic) on a leakage-free `prob_cal` split; stage 3 adds the
+  adaptive level and separates the older and newer half of the test stream, so a coverage loss from
+  temporal drift is attributable to *when* it happened.
 - **Lightweight tests.** The conformal layer is unit tested with `numpy` and `unittest` only, so the
   mathematics can be verified without the boosters installed.
 
@@ -109,6 +118,45 @@ Implementation notes:
 - `src/metrics.py` implements PR-AUC and ROC-AUC with `numpy` alone, so reported numbers do not depend
   on a scikit-learn version.
 
+### Stage 3: the level becomes a sequence
+
+Both schemes above calibrate once and then freeze. On a chronological split that is exactly the
+assumption a fraud stream breaks: the quantile of the legitimate stratum in the *calibration* window is
+not the quantile of the *test* window three weeks later, so `1 − α` is met on average over the
+calibration block and missed on the block that matters. Class-conditional adaptive conformal inference
+(ACI, Gibbs & Candès 2021) replaces the constant level with a sequence that reacts to its own errors,
+
+```
+α_{t+1, c} = α_{t, c} + γ (α − err_t)      for c = Y_t
+α_{t+1, c'} = α_{t, c'}                    for c' ≠ Y_t
+err_t = 1{ Y_t ∉ C_t(X_t) }
+```
+
+and forms the set at step `t` from the two class-conditional quantiles at their *current* levels,
+
+```
+C_t = { c ∈ {0, 1} : s(x_t, c) ≤ q_c(α_{t, c}) }
+```
+
+Three design choices carry the meaning of the method:
+
+- **Only the observed class moves.** A miscoverage of the fraud quantile says nothing about how the
+  legitimate quantile should be relaxed. Moving both levels on every event would let the majority
+  class — which supplies almost every label — erase the correction the minority class needs.
+- **The update is causal.** `Y_t` is consumed strictly after `C_t` has been emitted. In production the
+  label of transaction `t` is a chargeback that arrives weeks later, which is the same order with a
+  known delay; a set that used its own label would look perfect and be worthless.
+- **The level is projected onto `[1e-4, 1 − 1e-4]`.** The quantile query needs a level strictly inside
+  `(0, 1)`; the two ends mean "include the class for every transaction" and "keep only the most
+  confident transactions". `γ` is the step size: a level can travel the whole `[0, 1]` range in about
+  `1/γ` updates of one class, which is the resolution at which a shift can be followed. It is exposed
+  as `aci_gamma` in the config and `--aci-gamma` on the command line.
+
+What the guarantee becomes: for a class with enough labels in the stream, the long-run average error
+rate of that class converges to `α`, so `1 − α` is recovered over the stream rather than assumed for
+every transaction. With `α = 0.05` and `γ = 0.005` the fraud level moves by at most 0.05 % per observed
+fraud, and the queue widens only where the errors actually accumulate.
+
 ## Project Structure
 
 ```
@@ -117,19 +165,23 @@ imbalanced-conformal-fraud
 │   ├── ulb.yaml                 # ULB paths, chronological split, seeds, alpha grid, model params
 │   ├── ieee_cis.yaml            # IEEE-CIS config (transaction + identity join), same schema
 │   ├── ulb_ablation.yaml        # stage-2 sweep: weighted / unweighted x none / platt / isotonic
-│   └── ieee_cis_ablation.yaml   # stage-2 sweep on IEEE-CIS, same schema
+│   ├── ieee_cis_ablation.yaml   # stage-2 sweep on IEEE-CIS, same schema
+│   ├── ulb_stage3.yaml          # stage 3: standard vs mondrian vs adaptive_mondrian, unweighted_raw
+│   └── ieee_cis_stage3.yaml     # stage 3 on IEEE-CIS, same schema
 ├── src
 │   ├── __init__.py              # package metadata
-│   ├── conformal.py             # StandardSplitCP, MondrianCP, score and quantile helpers
+│   ├── conformal.py             # StandardSplitCP, MondrianCP, AdaptiveMondrianCP, quantile helpers
 │   ├── data.py                  # chronological split (+ optional prob_cal block); ULB and IEEE-CIS loaders
-│   ├── metrics.py               # PR-AUC, ROC-AUC, Brier, ECE, coverage / triage metrics, CSV IO
+│   ├── metrics.py               # PR-AUC, ROC-AUC, Brier, ECE, coverage / triage metrics, half-stream report, CSV IO
 │   ├── models.py                # XGBoost / LightGBM + Platt and isotonic calibrators
 │   ├── utils.py                 # seeding, YAML config loading, output directories
-│   └── visualize.py             # alpha trade-off figures (per scheme and per ablation variant)
+│   └── visualize.py             # alpha trade-off figures (per scheme, per ablation arm, stage-3 comparison)
 ├── tests
 │   ├── test_conformal.py        # quantile, four set types, class-conditional coverage (numpy only)
+│   ├── test_stage3_aci.py       # ACI: causality, class-conditional update, drift recovery (numpy only)
 │   ├── test_metrics.py          # PR-AUC / ROC-AUC vs. brute force, coverage accounting
 │   ├── test_calibration.py      # Brier, ECE, Platt / isotonic, prob_cal split, leakage guards
+│   ├── test_outputs.py          # dataset-prefixed metric filenames
 │   └── test_data.py             # temporal split arithmetic, chronological ordering
 ├── run_experiment.py            # CLI: models × seeds × methods × alphas -> CSVs + figures
 ├── requirements.txt
@@ -138,9 +190,9 @@ imbalanced-conformal-fraud
 ```
 
 Execution flow: `run_experiment.py` reads `configs/<dataset>.yaml`, builds a `SplitDataset` through
-`src.data`, trains each configured model per seed with `src.models`, calibrates both CP variants with
-`src.conformal`, scores the test block, and writes the tables from `src.metrics` and the figures from
-`src.visualize`.
+`src.data`, trains each configured model per seed with `src.models`, calibrates the configured CP
+variants with `src.conformal` (the adaptive one consumes the test labels in time order), scores the
+test block, and writes the tables from `src.metrics` and the figures from `src.visualize`.
 
 ## Getting Started
 
@@ -150,6 +202,13 @@ Execution flow: `run_experiment.py` reads `configs/<dataset>.yaml`, builds a `Sp
 git clone https://github.com/Serena-G-LEE/imbalanced-conformal-fraud.git
 cd imbalanced-conformal-fraud
 python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+On Windows PowerShell the same steps, with the interpreter and activation name the platform uses:
+
+```powershell
+py -m venv .venv; .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
@@ -195,18 +254,21 @@ and continues with transaction features only when it is absent.
 ### 3. Run Experiments
 
 ```bash
-# ULB, default grid: 2 models × 5 seeds × 2 methods × 4 alphas
+# stage 1, default grid: 2 models × 5 seeds × 2 methods × 4 alphas
 python run_experiment.py --dataset ulb --data-path data/ulb/creditcard.csv
-
-# a smaller sweep
-python run_experiment.py --dataset ulb --models xgboost --seeds 42 43 --alphas 0.05 0.10
-
-# IEEE-CIS (transaction + identity join)
 python run_experiment.py --dataset ieee_cis --data-path data/ieee_cis
 
+# a smaller sweep (one model, two seeds, two alphas)
+python run_experiment.py --dataset ulb --data-path data/ulb/creditcard.csv --models xgboost --seeds 42 43 --alphas 0.05 0.10
+python run_experiment.py --dataset ieee_cis --data-path data/ieee_cis --models xgboost --seeds 42 43 --alphas 0.05 0.10
+
 # headless run without figures
-python run_experiment.py --dataset ulb --no-figures
+python run_experiment.py --dataset ulb --data-path data/ulb/creditcard.csv --no-figures
+python run_experiment.py --dataset ieee_cis --data-path data/ieee_cis --no-figures
 ```
+
+Every command in this README is a single line on purpose: it pastes unchanged into a POSIX shell and
+into Windows PowerShell, where a trailing `\` is not a line continuation.
 
 | Flag | Default | Description |
 | --- | --- | --- |
@@ -217,6 +279,7 @@ python run_experiment.py --dataset ulb --no-figures
 | `--models` | all in config | subset of configured model names **or variant labels** |
 | `--seeds` | `42 43 44 45 46` | random seeds |
 | `--alphas` | `0.01 0.03 0.05 0.10` | target miscoverage levels |
+| `--aci-gamma` | from config (`0.005`) | step size of the adaptive Mondrian (ACI) level update |
 | `--no-figures` | off | skip PNG generation |
 
 Config keys (both datasets share one schema):
@@ -240,7 +303,8 @@ models:
 experiment:
   seeds: [42, 43, 44, 45, 46]
   alpha_grid: [0.01, 0.03, 0.05, 0.10]
-  methods: [standard, mondrian]
+  methods: [standard, mondrian]     # stage 3 adds adaptive_mondrian
+  aci_gamma: 0.005                 # step size of the adaptive level update
   output_dir: results
 ```
 
@@ -258,14 +322,16 @@ rate. The ablation crosses that choice with post-hoc probability calibration:
 ```bash
 # ULB: 2 boosters x 5 arms x 5 seeds x 2 schemes x 4 alphas
 python run_experiment.py --dataset ulb --config configs/ulb_ablation.yaml
+# IEEE-CIS: 2 boosters x 5 arms x 5 seeds x 2 schemes x 4 alphas
+python run_experiment.py --dataset ieee_cis --config configs/ieee_cis_ablation.yaml
 
-# IEEE-CIS (10 arms x 600 trees is long; start with two arms and two seeds)
-python run_experiment.py --dataset ieee_cis --config configs/ieee_cis_ablation.yaml \
-    --models unweighted_raw unweighted_platt --seeds 42 43 --no-figures
+# quick look: two arms, two seeds, no figures (10 arms x 600 trees is a long run on CPU)
+python run_experiment.py --dataset ulb --config configs/ulb_ablation.yaml --models unweighted_raw unweighted_platt --seeds 42 43 --no-figures
+python run_experiment.py --dataset ieee_cis --config configs/ieee_cis_ablation.yaml --models unweighted_raw unweighted_platt --seeds 42 43 --no-figures
 
 # only the re-weighting question, all seeds
-python run_experiment.py --dataset ulb --config configs/ulb_ablation.yaml \
-    --models weighted_raw unweighted_raw
+python run_experiment.py --dataset ulb --config configs/ulb_ablation.yaml --models weighted_raw unweighted_raw
+python run_experiment.py --dataset ieee_cis --config configs/ieee_cis_ablation.yaml --models weighted_raw unweighted_raw
 ```
 
 Arms in both ablation configs (`weighted_raw`, `unweighted_raw`, `unweighted_platt`,
@@ -312,6 +378,10 @@ So the honest reading is: if a `weighted_*` model has a large review queue and i
 same queue with a much lower Brier/ECE, the queue was **not** a probability-scale problem — it is the
 model fit (the ranking) that the re-weighting changed, and recalibration alone cannot buy back review
 capacity. That is exactly the negative control the stage-2 experiment is for.
+
+The residual coverage shortfall that stage 2 measured on IEEE-CIS (both classes a few points below
+nominal) is what stage 3 addresses with adaptive levels; see
+[Stage 3: Adaptive Mondrian CP](#stage-3-adaptive-mondrian-cp-aci).
 
 ## Results: 5-seed Stage-2 ablation at `alpha = 0.05`
 
@@ -404,8 +474,7 @@ thousands of frauds, so the quantile is not starved; Mondrian fraud coverage sti
 coverage is short on those same arms (94.4 %–94.6 %), which identifies the cause as exchangeability
 breaking across `TransactionDT` rather than class imbalance: on ULB, where the file is a two-day draw
 with no comparable shift, normal coverage sits *above* nominal for every arm (95.2 %–97.6 %). This is
-the empirical motivation for the adaptive /
-time-weighted CP in Future Work.
+the empirical motivation for stage 3 ([adaptive Mondrian CP](#stage-3-adaptive-mondrian-cp-aci)).
 - **Isotonic is not free here either.** It lowers PR-AUC to 0.468 (from 0.484) and widens the queue to
 44.5 %–45.7 %; Platt, by contrast, leaves sets identical to `unweighted_raw` while cutting ECE by one
 to two orders of magnitude (1.20e-1 → 5.48e-3 on XGBoost, 7.28e-2 → 7.11e-3 on LightGBM).
@@ -414,6 +483,78 @@ to two orders of magnitude (1.20e-1 → 5.48e-3 on XGBoost, 7.28e-2 → 7.11e-3 
 score feeds a decision rule, keep Mondrian CP for the class-conditional guarantee, and use Platt only
 when an honest probability is needed downstream — it will not buy review capacity, and isotonic actively
 spends it.
+
+## Stage 3: Adaptive Mondrian CP (ACI)
+
+Stage 2 left one number unexplained: on IEEE-CIS the *unweighted* Mondrian arms cover 91.1 % – 92.1 % of
+fraud at `alpha = 0.05` against a 95 % target, while normal coverage is short on the same arms (94.4 % –
+94.6 %). Both classes miss in the same direction, which identifies the cause as exchangeability breaking
+across `TransactionDT` rather than class imbalance — on ULB, whose file is a two-day draw with no
+comparable shift, normal coverage sits *above* nominal for every arm.
+
+Stage 3 asks the obvious follow-up: if the thresholds are stale, let them move. `adaptive_mondrian` is
+class-conditional ACI (see [Method](#stage-3-the-level-becomes-a-sequence) for the recursion): the two
+quantiles still come from the untouched calibration block, but the level driving each of them is updated
+by the errors the stream produces, one class at a time, strictly after each set has been emitted.
+
+```bash
+python run_experiment.py --dataset ulb --config configs/ulb_stage3.yaml
+python run_experiment.py --dataset ieee_cis --config configs/ieee_cis_stage3.yaml
+```
+
+Both configs hold the stage-2 winning arm (`unweighted_raw`: `scale_pos_weight: 1.0`, `calibrator:
+none`), five seeds (`42–46`) and the four levels `[0.01, 0.03, 0.05, 0.10]`, so the only thing that
+changes across a row is the calibration scheme:
+
+| `method` | threshold | level |
+| --- | --- | --- |
+| `standard` | one, pooled over both classes | fixed `alpha` |
+| `mondrian` | one per class | fixed `alpha` |
+| `adaptive_mondrian` | one per class | `alpha_t` per class, updated online (ACI) |
+
+`experiment.aci_gamma` (default `0.005`, override with `--aci-gamma`) is the only new knob. A larger
+step reacts faster and pays with a noisier level:
+
+```bash
+python run_experiment.py --dataset ulb --config configs/ulb_stage3.yaml --aci-gamma 0.01
+python run_experiment.py --dataset ieee_cis --config configs/ieee_cis_stage3.yaml --aci-gamma 0.01
+```
+
+A run writes the usual `<dataset>_summary_metrics.csv` / `<dataset>_per_seed_metrics.csv` plus one
+figure per model, `<dataset>_<model>_stage3_methods.png`:
+
+- **left** — fraud coverage over the whole test block against the nominal `1 − α` line;
+- **middle** — the manual review queue, i.e. what the extra coverage costs;
+- **right** — fraud coverage in the *newer half* of the test stream, which is where a scheme calibrated
+  once on the past loses the guarantee first and where the adaptive level is supposed to buy it back.
+
+How to read a stage-3 run:
+
+- Compare the right panel with the left panel. A static scheme whose two halves sit on top of each
+  other has no drift to fix; one whose newer half drops below the nominal line has a coverage loss that
+  is *dated*, and that is the case ACI addresses.
+- `alpha_final_normal` / `alpha_final_fraud` in the CSVs are the levels the two classes ended on. A
+  fraud level well below the nominal `alpha` means the stream kept missing frauds and the queue had to
+  widen; a level that stays at `alpha` means the class was already covered. For the static schemes the
+  two columns are simply `alpha`.
+- ACI spends review capacity only where errors accumulate, so a rise in `triage_rate` is the price line
+  of the coverage it recovers. Read the two together, never one without the other.
+- The scheme needs minority-class labels **inside the stream**. IEEE-CIS has thousands of frauds in its
+  20 % test block, so the fraud level gets a signal every few hundred transactions; ULB's test block holds
+  roughly a hundred frauds over two days, which is close to the point where one fraud moves the level
+  more than the drift does. A small or absent difference on ULB is therefore an expected outcome, not a
+  failure of the implementation.
+- `γ` sets the time scale. If `alpha_final_*` runs to a bound (the `1e-4` / `1 − 1e-4` projection), the
+  stream is asking for coverage no fixed quantile can deliver; that is the honest signal that the
+  *score* broke, not the calibration, and it is the case for a new model rather than a wider threshold.
+
+Numbers for stage 3 are produced by those two commands on the machine that owns the data, as with stage
+2; this README does not carry a stage-3 results table, because a table whose provenance is a run you
+cannot repeat is worse than no table. The *mechanism* is what the repository can pin down, and it is
+pinned by tests: `tests/test_stage3_aci.py` runs a synthetic stream whose fraud scores decay over time
+and asserts that static Mondrian coverage falls to 84 – 92 % at `alpha = 0.05` while the adaptive scheme
+recovers to at least 93 % on every seed, with the legitimate level staying within two points of nominal
+so the review queue is not widened for a class that did not drift.
 
 ## Evaluation Metrics
 
@@ -433,10 +574,20 @@ spends it.
 | `singleton_normal_precision` / `_recall` | precision and recall of the `{0}` set alone | same |
 | `fraud_triage_capture` | share of true frauds routed to review rather than auto-declined | same |
 | `mean_set_size` | average cardinality of the prediction sets | same |
-| `coverage_*_mean/std`, `triage_rate_mean/std` | mean ± standard deviation across seeds | `<dataset>_summary_metrics.csv` |
+| `coverage_fraud_first_half`, `coverage_fraud_second_half` | fraud coverage in the older / newer half of the test stream (chronological order) | same |
+| `triage_rate_first_half`, `triage_rate_second_half` | review-queue share in each half | same |
+| `aci_gamma` | ACI step size used; `nan` for the two static schemes | same |
+| `alpha_final_normal`, `alpha_final_fraud` | miscoverage level each class ended the stream on (`alpha` for the static schemes) | same |
+| `coverage_*_mean/std`, `triage_rate_mean/std`, `coverage_fraud_second_half_mean`, `alpha_final_fraud_mean`, … | mean ± standard deviation across seeds | `<dataset>_summary_metrics.csv` |
 
 `triage_rate` is the operational cost curve: at a fixed fraud-coverage target, the calibration scheme
 with the lower `triage_rate` is the one an operations team wants.
+
+The `*_first_half` / `*_second_half` columns split the test block at its midpoint, keeping the
+chronological order the loaders guarantee. They are what separates "this scheme covers less" from "this
+scheme covers less *now*": a static scheme that loses coverage in the newer half is the drift signature,
+and an adaptive scheme is allowed to look flat across the two halves only if it paid for it in
+`triage_rate_second_half`.
 
 `ece` uses equal-mass bins by default (`strategy="quantile"`). At a 0.172 % fraud rate a uniform 15-bin
 split over `[0, 1]` puts every transaction in the first bin, where the metric collapses to
@@ -462,15 +613,20 @@ The metric CSVs are prefixed with the dataset name (`ulb_summary_metrics.csv`,
 `coverage_fraud_mean/std`, `coverage_normal_mean/std`, `coverage_mean/std`, `triage_rate_mean/std`,
 `empty_rate_mean/std`, `fraud_triage_capture_mean`, `mean_set_size_mean`,
 `singleton_fraud_precision_mean`, `singleton_fraud_recall_mean`, `pr_auc_mean/std`,
-`roc_auc_mean/std`, `brier_mean/std`, `ece_mean/std`, `brier_raw_mean/std` and `ece_raw_mean/std`.
+`roc_auc_mean/std`, `brier_mean/std`, `ece_mean/std`, `brier_raw_mean/std` and `ece_raw_mean/std`,
+plus the stage-3 columns `coverage_fraud_first_half_mean`, `coverage_fraud_second_half_mean`,
+`triage_rate_first_half_mean`, `triage_rate_second_half_mean`, `alpha_final_normal_mean` and
+`alpha_final_fraud_mean`.
 
-Each figure has two panels: empirical fraud coverage against the nominal `1 − α` reference line on the
-left, and the share of transactions in `{0, 1}` on the right, both with seed-standard-deviation error
-bars. The expected reading is a flat standard-CP curve far below the diagonal, a Mondrian curve that
-tracks `1 − α`, and a review rate that rises as `α` is tightened — the cost of keeping the guarantee.
+Each stage-1 figure has two panels: empirical fraud coverage against the nominal `1 − α` reference line
+on the left, and the share of transactions in `{0, 1}` on the right, both with seed-standard-deviation
+error bars. The expected reading is a flat standard-CP curve far below the diagonal, a Mondrian curve
+that tracks `1 − α`, and a review rate that rises as `α` is tightened — the cost of keeping the guarantee.
 The ablation figure repeats it with one line per variant at a fixed scheme (Mondrian by default), so
 `weighted_raw` versus `unweighted_raw` shows what re-weighting does to the queue and `*_platt` overlays
-whether recalibration changed it.
+whether recalibration changed it. The stage-3 figure draws all three schemes on one scale and adds a
+third panel with fraud coverage in the newer half of the stream, so the whole-block number and the
+place where drift bites are visible in the same picture.
 
 ## Tests
 
@@ -487,7 +643,16 @@ ECE against hand-computed values, monotonicity and `out_of_bounds="clip"` behavi
 the chronological `prob_cal` split (no overlap with `calibration`, arrays copied), the leakage guards
 (`calibrator` without a `prob_cal` block, `X_prob_cal is X_cal`), and the invariance result — a strictly
 increasing recalibration leaves Mondrian prediction sets unchanged while the pooled standard threshold
-moves. Only `numpy` is required; the pandas-backed loader test is skipped when pandas is absent.
+moves. `tests/test_stage3_aci.py` adds the adaptive scheme: the emitted set at every step is exactly the
+set implied by the level recorded at that step, the same stream run twice is identical, frozen updates
+reproduce static Mondrian codes to the last set (which pins the repeated quantile lookup to
+`conformal_quantile`), and the causal property is tested from three angles — flipping every label from a
+cut onwards, truncating the stream at a cut, and flipping one label — none of which may change a decision
+taken before the change. The level recursion is checked against a hand-written ACI loop, only the
+observed class may move, the levels stay inside their projection interval, and a synthetic drifting
+stream shows the static scheme losing fraud coverage while the adaptive one recovers it without widening
+the legitimate class. Only `numpy` is required; the pandas-backed loader test is skipped when pandas is
+absent and the runner-integration test mocks the booster.
 
 ## Experimental Protocol and Reproducibility
 
@@ -500,11 +665,18 @@ moves. Only `numpy` is required; the pandas-backed loader test is skipped when p
   sentinels), so no statistic crosses the split boundary.
 - **Seeds affect only the booster** (subsampling, column sampling). Conformal thresholds are
   deterministic given the calibration set, so seed variance reports model variance, not CP variance.
+- **The adaptive stream is causal.** Stage 3 walks the test block in time order and updates a level only
+  after the set of that transaction has been emitted. Nothing in the loop reads a label ahead of its own
+  position, which is asserted by the causality tests, and the levels are a deterministic function of the
+  label prefix — so the same seed produces the same stream and a truncated stream reproduces the same
+  prefix.
 - **Exchangeability.** The finite-sample guarantee assumes exchangeable data; a chronological split
   deliberately breaks it in exchange for an honest evaluation protocol. Empirical coverage is therefore
-  the quantity to monitor, and it is reported per class at every `alpha`. The guarantee should be read
-  as the design target rather than an unconditional promise under drift — a known tension in the
-  time-series CP literature and the natural next extension of this work.
+  the quantity to monitor, and it is reported per class at every `alpha`. Stage 3 does not restore the
+  exchangeability assumption — it replaces the fixed level with an online one, whose guarantee is a
+  long-run error rate over the stream rather than a per-transaction bound. The static guarantees should
+  therefore still be read as the design target, and the adaptive numbers as what a deployed loop can
+  actually hold.
 
 ## Branching Strategy
 
@@ -523,13 +695,19 @@ outputs stay out of version control. Full rules, including commit conventions, a
   a few hundred positives and on IEEE-CIS a few thousand. A quantile-of-score diagnostic (vary
   `prob_cal_fraction` and watch the Brier / ECE spread) is the natural follow-up, as is temperature
   scaling fit by cross-validation inside `train_fit`.
-- Static calibration: quantiles are fit once on a 20 % window. Online / adaptive CP is the natural
-  response to concept drift.
+- Static quantiles, adaptive levels: the quantiles come from one 20 % window and only the *level* moves
+  in stage 3. Time-weighted CP (weights decaying with age) would move the quantile itself and is the
+  natural next comparison; so is an adaptive step size (`γ` is a fixed constant here, and a `γ` tuned
+  per class would separate fast and slow drift).
 - No label delay: real chargebacks arrive weeks after the transaction, so calibration labels here are
-  optimistic.
+  optimistic. The adaptive loop reads label `t` immediately after step `t`; delaying it by a fixed
+  number of steps changes the time scale of the correction and is the honest version of this protocol.
+- The minority class needs labels: ACI can only correct a class it observes. On ULB's two-day test block
+  that is roughly a hundred frauds, which is why the stage-3 effect is expected on IEEE-CIS and small on
+  ULB; a delay-robust or label-scarce variant is future work.
 - Planned: cost-sensitive queue construction (rank `{0, 1}` by score under a daily review budget), a
-  per-time-slice coverage diagnostic, and a comparison against cost-tuned threshold baselines at matched
-  review volume.
+  per-time-slice coverage diagnostic finer than the two halves used here, and a comparison against
+  cost-tuned threshold baselines at matched review volume.
 
 ## Citation
 
@@ -553,6 +731,12 @@ If you use this code, please cite the repository:
   Uncertainty Quantification.* arXiv:2107.07511, 2021.
 - Lei, G'Sell, Rinaldo, Tibshirani & Wasserman. *Distribution-Free Predictive Inference for Regression.*
   JASA, 2018.
+- Gibbs & Candès. *Adaptive Conformal Inference Under Distribution Shift.* NeurIPS, 2021. (The ACI
+  recursion used in stage 3.)
+- Gibbs & Candès. *Conformal Inference for Online Prediction with Arbitrary Distribution Shifts.*
+  JMLR, 2024. (Long-run coverage of adaptive levels under drift.)
+- Zaffran, Dieuleveut, Josse & Romano. *Adaptive Conformal Predictions for Time Series.* ICML, 2022.
+  (Class-conditional adaptation of the same idea.)
 - Dal Pozzolo, Caelen, Johnson & Bontempi. *Calibrating Probability with Undersampling for Unbalanced
   Classification.* IEEE SSCI, 2015. (ULB dataset.)
 - IEEE-CIS Fraud Detection, Kaggle, 2019.
