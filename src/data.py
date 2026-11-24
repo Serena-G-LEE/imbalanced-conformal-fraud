@@ -86,8 +86,9 @@ class SplitDataset:
         the current training rows, so it sits strictly between the model's fit
         window and the conformal calibration window.  ``X_cal``, ``y_cal``,
         ``X_test`` and ``y_test`` are carried over unchanged: the conformal
-        quantiles keep using the same rows.  Every array is copied, so no
-        downstream in-place edit can reach back into the original split.
+        quantiles keep using the same rows.  Only the two training slices are
+        copied, so the fit block does not alias the original training array and
+        the call does not duplicate the (large) calibration and test blocks.
         """
         if self.has_prob_cal:
             raise ValueError("dataset already has a prob_cal block")
@@ -105,10 +106,10 @@ class SplitDataset:
             name=self.name,
             X_train=self.X_train[fit_idx].copy(),
             y_train=self.y_train[fit_idx].copy(),
-            X_cal=self.X_cal.copy(),
-            y_cal=self.y_cal.copy(),
-            X_test=self.X_test.copy(),
-            y_test=self.y_test.copy(),
+            X_cal=self.X_cal,
+            y_cal=self.y_cal,
+            X_test=self.X_test,
+            y_test=self.y_test,
             feature_names=list(self.feature_names),
             meta=meta,
             X_prob_cal=self.X_train[prob_idx].copy(),
