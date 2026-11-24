@@ -1,0 +1,52 @@
+# IEEE-CIS Fraud Detection (Kaggle 2019).
+# train_transaction.csv (590,540 rows, ~3.5 % fraud) left-joined with
+# train_identity.csv on TransactionID. Categorical columns are frequency
+# encoded on the training block only; numeric missing values get a sentinel.
+
+dataset: ieee_cis
+
+data:
+  dir_path: data/ieee_cis
+  transaction_file: train_transaction.csv
+  identity_file: train_identity.csv
+  time_column: TransactionDT
+  label_column: isFraud
+  log1p_amount: true
+  fill_value: -1.0
+  # Same chronological protocol as ULB: oldest 60 % train, next 20 %
+  # calibration, newest 20 % test.
+  splits:
+    train: 0.60
+    calibration: 0.20
+    test: 0.20
+
+models:
+  - name: xgboost
+    scale_pos_weight: auto
+    params:
+      n_estimators: 600
+      max_depth: 6
+      learning_rate: 0.05
+      subsample: 0.8
+      colsample_bytree: 0.6
+      min_child_weight: 2.0
+      reg_lambda: 2.0
+      tree_method: hist
+
+  - name: lightgbm
+    scale_pos_weight: auto
+    params:
+      n_estimators: 600
+      num_leaves: 63
+      learning_rate: 0.05
+      subsample: 0.8
+      subsample_freq: 1
+      colsample_bytree: 0.6
+      min_child_samples: 40
+      reg_lambda: 2.0
+
+experiment:
+  seeds: [42, 43, 44, 45, 46]
+  alpha_grid: [0.01, 0.03, 0.05, 0.10]
+  methods: [standard, mondrian]
+  output_dir: results
