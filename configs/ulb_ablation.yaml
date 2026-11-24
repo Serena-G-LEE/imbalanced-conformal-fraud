@@ -1,0 +1,175 @@
+# Stage-2 ablation: class re-weighting (scale_pos_weight) x probability calibration.
+#
+# Same data, split and CP grid as configs/ulb.yaml, plus a probability-calibration
+# arm.  `prob_cal_fraction: 0.15` cuts the most recent 15 % of the training window
+# into a `prob_cal` block: Platt / isotonic maps are fit there, the boosters are
+# refit on the remaining 85 %, and the conformal quantiles still come only from the
+# separate `calibration` block.  Every arm is fit on the same rows, so the only
+# differences are the re-weighting and the calibrator.
+#
+#   python run_experiment.py --dataset ulb --config configs/ulb_ablation.yaml
+
+dataset: ulb
+
+data:
+  path: data/ulb/creditcard.csv
+  time_column: Time
+  label_column: Class
+  log1p_amount: true
+  # Chronological cut. Model fit on the oldest (train - prob_cal), probability
+  # calibration on the next 15 %, conformal thresholds on the next 20 %, test on
+  # the newest 20 %.
+  splits:
+    train: 0.60
+    calibration: 0.20
+    test: 0.20
+  prob_cal_fraction: 0.15
+
+models:
+  # --- XGBoost ---------------------------------------------------------------
+  - name: xgboost
+    variant: weighted_raw
+    scale_pos_weight: auto        # negatives / positives in the training block
+    calibrator: none
+    params:
+      n_estimators: 400
+      max_depth: 4
+      learning_rate: 0.05
+      subsample: 0.8
+      colsample_bytree: 0.8
+      min_child_weight: 1.0
+      reg_lambda: 1.0
+      tree_method: hist
+
+  - name: xgboost
+    variant: unweighted_raw
+    scale_pos_weight: 1.0         # no re-weighting
+    calibrator: none
+    params:
+      n_estimators: 400
+      max_depth: 4
+      learning_rate: 0.05
+      subsample: 0.8
+      colsample_bytree: 0.8
+      min_child_weight: 1.0
+      reg_lambda: 1.0
+      tree_method: hist
+
+  - name: xgboost
+    variant: unweighted_platt
+    scale_pos_weight: 1.0
+    calibrator: platt
+    params:
+      n_estimators: 400
+      max_depth: 4
+      learning_rate: 0.05
+      subsample: 0.8
+      colsample_bytree: 0.8
+      min_child_weight: 1.0
+      reg_lambda: 1.0
+      tree_method: hist
+
+  - name: xgboost
+    variant: unweighted_isotonic
+    scale_pos_weight: 1.0
+    calibrator: isotonic
+    params:
+      n_estimators: 400
+      max_depth: 4
+      learning_rate: 0.05
+      subsample: 0.8
+      colsample_bytree: 0.8
+      min_child_weight: 1.0
+      reg_lambda: 1.0
+      tree_method: hist
+
+  - name: xgboost
+    variant: weighted_platt
+    scale_pos_weight: auto
+    calibrator: platt
+    params:
+      n_estimators: 400
+      max_depth: 4
+      learning_rate: 0.05
+      subsample: 0.8
+      colsample_bytree: 0.8
+      min_child_weight: 1.0
+      reg_lambda: 1.0
+      tree_method: hist
+
+  # --- LightGBM --------------------------------------------------------------
+  - name: lightgbm
+    variant: weighted_raw
+    scale_pos_weight: auto
+    calibrator: none
+    params:
+      n_estimators: 400
+      num_leaves: 31
+      learning_rate: 0.05
+      subsample: 0.8
+      subsample_freq: 1
+      colsample_bytree: 0.8
+      min_child_samples: 20
+      reg_lambda: 1.0
+
+  - name: lightgbm
+    variant: unweighted_raw
+    scale_pos_weight: 1.0
+    calibrator: none
+    params:
+      n_estimators: 400
+      num_leaves: 31
+      learning_rate: 0.05
+      subsample: 0.8
+      subsample_freq: 1
+      colsample_bytree: 0.8
+      min_child_samples: 20
+      reg_lambda: 1.0
+
+  - name: lightgbm
+    variant: unweighted_platt
+    scale_pos_weight: 1.0
+    calibrator: platt
+    params:
+      n_estimators: 400
+      num_leaves: 31
+      learning_rate: 0.05
+      subsample: 0.8
+      subsample_freq: 1
+      colsample_bytree: 0.8
+      min_child_samples: 20
+      reg_lambda: 1.0
+
+  - name: lightgbm
+    variant: unweighted_isotonic
+    scale_pos_weight: 1.0
+    calibrator: isotonic
+    params:
+      n_estimators: 400
+      num_leaves: 31
+      learning_rate: 0.05
+      subsample: 0.8
+      subsample_freq: 1
+      colsample_bytree: 0.8
+      min_child_samples: 20
+      reg_lambda: 1.0
+
+  - name: lightgbm
+    variant: weighted_platt
+    scale_pos_weight: auto
+    calibrator: platt
+    params:
+      n_estimators: 400
+      num_leaves: 31
+      learning_rate: 0.05
+      subsample: 0.8
+      subsample_freq: 1
+      colsample_bytree: 0.8
+      min_child_samples: 20
+      reg_lambda: 1.0
+
+experiment:
+  seeds: [42, 43, 44, 45, 46]
+  alpha_grid: [0.01, 0.03, 0.05, 0.10]
+  methods: [standard, mondrian]
+  output_dir: results
