@@ -20,7 +20,9 @@ __all__ = [
     "METRIC_COLUMNS",
     "aggregate_rows",
     "average_precision_score",
+    "brier_score",
     "conformal_report",
+    "ece",
     "roc_auc_score",
     "write_csv",
 ]
@@ -29,11 +31,17 @@ __all__ = [
 METRIC_COLUMNS: Sequence[str] = (
     "dataset",
     "model",
+    "variant",
+    "calibrator",
     "method",
     "alpha",
     "seed",
     "pr_auc",
     "roc_auc",
+    "brier",
+    "ece",
+    "brier_raw",
+    "ece_raw",
     "prevalence",
     "n_test",
     "n_normal",
@@ -61,7 +69,13 @@ METRIC_COLUMNS: Sequence[str] = (
 )
 
 #: Identifiers that must never be averaged across seeds.
-_NON_METRIC_KEYS = {"dataset", "model", "method", "seed", "params"}
+_NON_METRIC_KEYS = {"dataset", "model", "variant", "calibrator", "method", "seed", "params"}
+
+#: Default binning strategy for ``ece``: equal-mass bins.  With 0.172 %
+#: positives a uniform 15-bin grid puts every transaction in the first bin, so
+#: the score would be uninformative.
+_DEFAULT_ECE_BINS = 15
+_DEFAULT_ECE_STRATEGY = "quantile"
 
 
 def _as_pair(labels, scores):
@@ -103,6 +117,69 @@ def average_precision_score(labels, scores) -> float:
     recall = true_positive / n_positive
     increments = np.diff(np.r_[0.0, recall])
     return float(np.sum(increments * precision))
+
+
+def brier_score(labels, scores) -> float:
+    """Mean squared error of the probability forecasts, ``mean((p - y)^2)``.
+
+    The Brier score is a proper scoring rule: it is minimised by the true
+    probability, so it drops when a miscalibrated score (e.g. one inflated by
+    ``scale_pos_weight``) is replaced by a calibrated one.  Returns ``nan`` for
+    an empty sample.
+    """
+    target, values = _as_pair(labels, scores)
+    if not np.all((values >= 0.0) & (values <= 1.0)):
+        raise ValueError("probability scores must lie in [0, 1]")
+    if target.size == 0:
+        return float("nan")
+    return float(np.mean((values - target) ** 2))
+
+
+def _ece_bin_index(values: np.ndarray, n_bins: int, strategy: str) -> np.ndarray:
+    if strategy == "uniform":
+        index = np.clip((values * n_bins).astype(int), 0, n_bins - 1)
+        return index
+    if strategy == "quantile":
+        edges = np.quantile(values, np.linspace(0.0, 1.0, n_bins + 1))[1:-1]
+        return np.clip(np.searchsorted(edges, values, side="left"), 0, n_bins - 1)
+    raise ValueError(f"unknown ECE binning strategy {strategy!r}; expected 'uniform' or 'quantile'")
+
+
+def ece(
+    labels,
+    scores,
+    n_bins: int = _DEFAULT_ECE_BINS,
+    strategy: str = _DEFAULT_ECE_STRATEGY,
+) -> float:
+    """Expected Calibration Error, ``sum_b (n_b / n) * |acc_b - conf_b|``.
+
+    Bins are either fixed-width over ``[0, 1]`` (``strategy="uniform"``) or
+    equal-mass quantile bins of the scores (``strategy="quantile"``, the
+    default).  Equal-mass bins are the meaningful choice under extreme
+    imbalance: at a 0.172 % fraud rate a uniform grid puts every score into the
+    first bin and collapses the metric to the prevalence.
+
+    Returns ``nan`` for an empty sample and raises for scores outside ``[0, 1]``.
+    """
+    target, values = _as_pair(labels, scores)
+    if not np.all((values >= 0.0) & (values <= 1.0)):
+        raise ValueError("probability scores must lie in [0, 1]")
+    if target.size == 0:
+        return float("nan")
+    bins = int(n_bins)
+    if bins < 1:
+        raise ValueError(f"n_bins must be at least 1, got {n_bins}")
+
+    index = _ece_bin_index(values, bins, str(strategy).strip().lower())
+    total = 0.0
+    n = float(target.size)
+    for bin_id in np.unique(index):
+        mask = index == bin_id
+        share = float(np.sum(mask)) / n
+        confidence = float(np.mean(values[mask]))
+        accuracy = float(np.mean(target[mask]))
+        total += share * abs(accuracy - confidence)
+    return float(total)
 
 
 def _average_ranks(values: np.ndarray) -> np.ndarray:
@@ -238,7 +315,7 @@ def _numeric_metric_keys(rows: Sequence[Dict[str, object]], group_keys: Sequence
 
 def aggregate_rows(
     rows: Sequence[Dict[str, object]],
-    group_keys: Sequence[str] = ("dataset", "model", "method", "alpha"),
+    group_keys: Sequence[str] = ("dataset", "model", "variant", "method", "alpha"),
 ) -> List[Dict[str, object]]:
     """Mean and standard deviation across seeds for every numeric metric.
 
