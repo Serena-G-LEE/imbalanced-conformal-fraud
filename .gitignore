@@ -1,0 +1,35 @@
+# Datasets (download separately; never commit transaction data)
+data/
+*.csv
+*.parquet
+!configs/*.csv
+
+# Experiment outputs
+results/
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.python-version
+
+# Tooling / editors
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+.vscode/
+.idea/
+
+# Secrets
+.env
+.env.*
+*.pem
