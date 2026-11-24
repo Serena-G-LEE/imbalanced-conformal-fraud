@@ -81,6 +81,20 @@ SUMMARY_COLUMNS = (
 )
 
 
+def metric_filenames(dataset_name: str) -> Dict[str, str]:
+    """Dataset-prefixed names for the two metric CSVs of a run.
+
+    Runs for several datasets are written under ``results/<dataset>/`` but are
+    routinely copied side by side (or into one analysis folder), where a bare
+    ``summary_metrics.csv`` says nothing about which benchmark it holds.  Every
+    file therefore carries its dataset name.
+    """
+    return {
+        "per_seed": f"{dataset_name}_per_seed_metrics.csv",
+        "summary": f"{dataset_name}_summary_metrics.csv",
+    }
+
+
 def _calibrator_of(spec: Dict[str, Any]) -> str:
     """Read a model spec's calibrator, normalising aliases and empties."""
     value = spec.get("calibrator", "none")
@@ -420,9 +434,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             + (failures[0]["error"] if failures else "unknown")
         )
 
-    per_seed_path = write_csv(run_root / "per_seed_metrics.csv", rows, METRIC_COLUMNS)
+    filenames = metric_filenames(dataset_name)
+    per_seed_path = write_csv(run_root / filenames["per_seed"], rows, METRIC_COLUMNS)
     summary = aggregate_rows(rows)
-    summary_path = write_csv(run_root / "summary_metrics.csv", summary, SUMMARY_COLUMNS)
+    summary_path = write_csv(run_root / filenames["summary"], summary, SUMMARY_COLUMNS)
 
     figures: List[str] = []
     if not args.no_figures:

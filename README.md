@@ -317,7 +317,7 @@ capacity. That is exactly the negative control the stage-2 experiment is for.
 
 | Metric | Definition | Reported in |
 | --- | --- | --- |
-| `pr_auc` | average precision of the fraud probability on the test block | `per_seed_metrics.csv`, `summary_metrics.csv` |
+| `pr_auc` | average precision of the fraud probability on the test block | `<dataset>_per_seed_metrics.csv`, `<dataset>_summary_metrics.csv` |
 | `roc_auc` | ROC-AUC (Mann-Whitney, ties = 0.5) | same |
 | `brier` | Brier score `mean((p - y)^2)` of the score the conformal layer uses | same |
 | `ece` | expected calibration error, equal-mass (quantile) bins, `sum_b n_b/n |acc_b - conf_b|` | same |
@@ -331,7 +331,7 @@ capacity. That is exactly the negative control the stage-2 experiment is for.
 | `singleton_normal_precision` / `_recall` | precision and recall of the `{0}` set alone | same |
 | `fraud_triage_capture` | share of true frauds routed to review rather than auto-declined | same |
 | `mean_set_size` | average cardinality of the prediction sets | same |
-| `coverage_*_mean/std`, `triage_rate_mean/std` | mean ± standard deviation across seeds | `summary_metrics.csv` |
+| `coverage_*_mean/std`, `triage_rate_mean/std` | mean ± standard deviation across seeds | `<dataset>_summary_metrics.csv` |
 
 `triage_rate` is the operational cost curve: at a fixed fraud-coverage target, the calibration scheme
 with the lower `triage_rate` is the one an operations team wants.
@@ -345,15 +345,18 @@ split over `[0, 1]` puts every transaction in the first bin, where the metric co
 
 ```
 results/<dataset>/
-├── per_seed_metrics.csv     # one row per model × variant × seed × method × alpha (37 columns)
-├── summary_metrics.csv      # mean / std across seeds for every `(model, variant, method, alpha)`
-├── run_metadata.json        # config, split sizes, prevalence, calibrator fits, timestamp, elapsed
+├── <dataset>_per_seed_metrics.csv   # one row per model × variant × seed × method × alpha (37 columns)
+├── <dataset>_summary_metrics.csv    # mean / std across seeds for every `(model, variant, method, alpha)`
+├── run_metadata.json                # config, split sizes, prevalence, calibrator fits, timestamp, elapsed
 └── figures/
     ├── <dataset>_<model>_alpha_tradeoff.png       # stage 1: scheme comparison
     └── <dataset>_<model>_ablation_tradeoff.png    # stage 2: one line per variant
 ```
 
-`summary_metrics.csv` is the table to read. For each `(model, variant, method, alpha)` it reports
+The metric CSVs are prefixed with the dataset name (`ulb_summary_metrics.csv`,
+`ieee_cis_summary_metrics.csv`, and the matching `*_per_seed_metrics.csv`), so files copied out of
+`results/` stay identifiable. `<dataset>_summary_metrics.csv` is the table to read. For each
+`(model, variant, method, alpha)` it reports
 `coverage_fraud_mean/std`, `coverage_normal_mean/std`, `coverage_mean/std`, `triage_rate_mean/std`,
 `empty_rate_mean/std`, `fraud_triage_capture_mean`, `mean_set_size_mean`,
 `singleton_fraud_precision_mean`, `singleton_fraud_recall_mean`, `pr_auc_mean/std`,
