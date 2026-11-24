@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 
-from src.conformal import MondrianCP, StandardSplitCP
+from src.conformal import AdaptiveMondrianCP, MondrianCP, StandardSplitCP
 from src.data import DEFAULT_PROB_CAL_FRACTION, SplitDataset, load_ieee_cis, load_ulb
 from src.metrics import (
     METRIC_COLUMNS,
@@ -32,17 +32,27 @@ from src.metrics import (
     conformal_report,
     ece,
     roc_auc_score,
+    stream_half_report,
     write_csv,
 )
 from src.models import CALIBRATORS, train_and_predict
 from src.utils import ensure_dir, load_config, save_json, set_global_seed, utc_timestamp
-from src.visualize import plot_alpha_tradeoff, plot_alpha_variant_tradeoff
+from src.visualize import (
+    plot_alpha_tradeoff,
+    plot_alpha_variant_tradeoff,
+    plot_stage3_methods_tradeoff,
+)
 
-CP_REGISTRY = {"standard": StandardSplitCP, "mondrian": MondrianCP}
+CP_REGISTRY = {
+    "standard": StandardSplitCP,
+    "mondrian": MondrianCP,
+    "adaptive_mondrian": AdaptiveMondrianCP,
+}
 
 DEFAULT_SEEDS = (42, 43, 44, 45, 46)
 DEFAULT_ALPHAS = (0.01, 0.03, 0.05, 0.10)
 DEFAULT_METHODS = ("standard", "mondrian")
+DEFAULT_ACI_GAMMA = 0.005
 
 SUMMARY_COLUMNS = (
     "dataset",
@@ -78,6 +88,12 @@ SUMMARY_COLUMNS = (
     "brier_raw_std",
     "ece_raw_mean",
     "ece_raw_std",
+    "coverage_fraud_first_half_mean",
+    "coverage_fraud_second_half_mean",
+    "triage_rate_first_half_mean",
+    "triage_rate_second_half_mean",
+    "alpha_final_normal_mean",
+    "alpha_final_fraud_mean",
 )
 
 
@@ -118,6 +134,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="subset of model names or variant labels in the config (e.g. --models xgboost unweighted_platt)")
     parser.add_argument("--seeds", nargs="+", type=int, default=None)
     parser.add_argument("--alphas", nargs="+", type=float, default=None)
+    parser.add_argument("--aci-gamma", type=float, default=None,
+                        help="step size of the adaptive Mondrian (ACI) level update")
     parser.add_argument("--no-figures", action="store_true", help="skip PNG generation")
     return parser
 
@@ -178,6 +196,14 @@ def _resolve_settings(args: argparse.Namespace, config: Dict[str, Any]) -> Dict[
     alphas = tuple(args.alphas) if args.alphas else tuple(experiment.get("alpha_grid", DEFAULT_ALPHAS))
     methods = tuple(experiment.get("methods", DEFAULT_METHODS))
     output_dir = args.output_dir or experiment.get("output_dir", "results")
+    raw_gamma = (
+        args.aci_gamma
+        if getattr(args, "aci_gamma", None) is not None
+        else experiment.get("aci_gamma", DEFAULT_ACI_GAMMA)
+    )
+    aci_gamma = float(raw_gamma)
+    if not 0.0 < aci_gamma < 1.0:
+        raise SystemExit(f"aci_gamma must lie in (0, 1), got {raw_gamma}")
 
     model_specs: List[Dict[str, Any]] = list(config.get("models", []) or [])
     if not model_specs:
@@ -230,6 +256,7 @@ def _resolve_settings(args: argparse.Namespace, config: Dict[str, Any]) -> Dict[
         "output_dir": Path(output_dir),
         "models": model_specs,
         "prob_cal_fraction": prob_cal_fraction,
+        "aci_gamma": aci_gamma,
     }
 
 
@@ -260,6 +287,13 @@ def _resolve_prob_cal_fraction(
     return fraction
 
 
+def _build_cp(method: str, alpha: float, aci_gamma: float):
+    """Instantiate a calibration scheme for one ``(method, alpha)`` cell."""
+    if method == "adaptive_mondrian":
+        return AdaptiveMondrianCP(alpha=alpha, gamma=aci_gamma)
+    return CP_REGISTRY[method](alpha=alpha)
+
+
 def _run_single_seed(
     dataset: SplitDataset,
     model_spec: Dict[str, Any],
@@ -268,6 +302,7 @@ def _run_single_seed(
     methods: Sequence[str],
     dataset_name: str,
     fit_log: Optional[List[Dict[str, Any]]] = None,
+    aci_gamma: float = DEFAULT_ACI_GAMMA,
 ) -> List[Dict[str, Any]]:
     """Train one model and evaluate every (method, alpha) cell for one seed."""
     name = str(model_spec.get("name", "")).strip().lower()
@@ -299,10 +334,13 @@ def _run_single_seed(
     rows: List[Dict[str, Any]] = []
     for method in methods:
         for alpha in alphas:
-            cp = CP_REGISTRY[method](alpha=alpha).calibrate(
+            cp = _build_cp(method, alpha, aci_gamma).calibrate(
                 prediction.prob_cal, dataset.y_cal
             )
-            codes = cp.predict_set_codes(prediction.prob_test)
+            # The adaptive scheme consumes the realised label stream: the label
+            # of transaction t enters only after C_t has been formed.  The
+            # static schemes ignore the argument.
+            codes = cp.predict_set_codes(prediction.prob_test, dataset.y_test)
             row: Dict[str, Any] = {
                 "dataset": dataset_name,
                 "model": name,
@@ -317,12 +355,16 @@ def _run_single_seed(
                 "ece": float(ece_value),
                 "brier_raw": float(brier_raw),
                 "ece_raw": float(ece_raw),
+                "aci_gamma": float(aci_gamma) if method == "adaptive_mondrian" else float("nan"),
+                "alpha_final_normal": float(alpha),
+                "alpha_final_fraud": float(alpha),
             }
             calibration = cp.describe()
             calibration.pop("method", None)
             calibration.pop("alpha", None)
             row.update(calibration)
             row.update(conformal_report(codes, dataset.y_test))
+            row.update(stream_half_report(codes, dataset.y_test))
             rows.append(row)
     return rows
 
@@ -332,8 +374,8 @@ def _print_summary(summary_rows: Sequence[Dict[str, Any]]) -> None:
         return
     header = (
         f"{'model':<10} {'variant':<20} {'method':<10} {'alpha':>6} "
-        f"{'fraud_cov':>10} {'normal_cov':>11} {'triage':>8} {'empty':>7} {'pr_auc':>8} "
-        f"{'brier':>8} {'ece':>8}"
+        f"{'fraud_cov':>10} {'late_half':>10} {'normal_cov':>11} {'triage':>8} {'empty':>7} "
+        f"{'pr_auc':>8} {'brier':>8} {'ece':>8}"
     )
     print("\n" + header)
     print("-" * len(header))
@@ -342,6 +384,7 @@ def _print_summary(summary_rows: Sequence[Dict[str, Any]]) -> None:
             f"{str(row['model']):<10} {str(row.get('variant') or '-'):<20} "
             f"{str(row['method']):<10} {float(row['alpha']):>6.3f} "
             f"{float(row['coverage_fraud_mean']):>10.4f} "
+            f"{float(row.get('coverage_fraud_second_half_mean', float('nan'))):>10.4f} "
             f"{float(row['coverage_normal_mean']):>11.4f} "
             f"{float(row['triage_rate_mean']):>8.4f} "
             f"{float(row['empty_rate_mean']):>7.4f} "
@@ -405,6 +448,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     settings["methods"],
                     dataset_name,
                     fit_log=fit_log if position == 0 else None,
+                    aci_gamma=settings["aci_gamma"],
                 )
             except Exception as error:  # noqa: BLE001 - one arm must not kill the sweep
                 # A long ablation should not lose the arms that already finished
@@ -470,6 +514,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                         method=primary_method,
                         variants=variants,
                     )
+                elif "adaptive_mondrian" in settings["methods"]:
+                    paths = plot_stage3_methods_tradeoff(
+                        model_rows,
+                        figure_dir,
+                        dataset=dataset_name,
+                        model=model_name,
+                        methods=settings["methods"],
+                    )
                 else:
                     paths = plot_alpha_tradeoff(
                         model_rows, figure_dir, dataset=dataset_name, model=model_name
@@ -491,6 +543,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "variants": [str(spec.get("variant") or "") for spec in settings["models"]],
         "calibrators": [_calibrator_of(spec) for spec in settings["models"]],
         "prob_cal_fraction": settings["prob_cal_fraction"],
+        "aci_gamma": settings["aci_gamma"],
         "dataset_summary": dataset.summary(),
         "fits": fit_log,
         "failures": failures,

@@ -3,6 +3,13 @@
 Everything here is implemented with ``numpy`` and the standard library so that
 the numbers do not depend on an installed scikit-learn version and can be unit
 tested without heavy dependencies.
+
+Besides the whole-block report (:func:`conformal_report`) there is a
+chronological half-split report (:func:`stream_half_report`): with a temporal
+test block the interesting question is not only *how much* fraud coverage was
+lost but *when*.  A scheme that is calibrated once loses coverage in the newer
+half; an adaptive scheme is allowed to recover there, and the two halves are
+what makes that visible in the CSVs.
 """
 
 from __future__ import annotations
@@ -22,6 +29,7 @@ __all__ = [
     "average_precision_score",
     "brier_score",
     "conformal_report",
+    "stream_half_report",
     "ece",
     "roc_auc_score",
     "write_csv",
@@ -66,10 +74,17 @@ METRIC_COLUMNS: Sequence[str] = (
     "q_fraud",
     "min_prob_positive_for_fraud",
     "max_prob_positive_for_normal",
+    "coverage_fraud_first_half",
+    "coverage_fraud_second_half",
+    "triage_rate_first_half",
+    "triage_rate_second_half",
+    "aci_gamma",
+    "alpha_final_normal",
+    "alpha_final_fraud",
 )
 
 #: Identifiers that must never be averaged across seeds.
-_NON_METRIC_KEYS = {"dataset", "model", "variant", "calibrator", "method", "seed", "params"}
+_NON_METRIC_KEYS = {"dataset", "model", "variant", "calibrator", "method", "seed", "params", "aci_gamma"}
 
 #: Default binning strategy for ``ece``: equal-mass bins.  With 0.172 %
 #: positives a uniform 15-bin grid puts every transaction in the first bin, so
@@ -280,6 +295,44 @@ def _format_cell(value):
     if isinstance(value, (int, np.integer)):
         return int(value)
     return value
+
+
+def stream_half_report(codes, labels) -> Dict[str, float]:
+    """Fraud coverage and review rate in the older and newer half of a stream.
+
+    ``codes`` and ``labels`` are in chronological order (the loaders keep the
+    time order of the file), so the two halves are the older and the newer part
+    of the test window.  A static split loses coverage in the newer half when
+    the distribution drifts; an adaptive scheme can widen there, and the
+    difference between ``coverage_fraud_first_half`` and
+    ``coverage_fraud_second_half`` is the quantity that separates them.
+
+    A half without any fraud reports ``nan`` for its coverage, so a thin test
+    window shows up as a missing number rather than as a fabricated zero.
+    """
+    membership = codes_to_membership(codes)
+    target = np.asarray(labels).ravel().astype(int)
+    if membership.shape[0] != target.size:
+        raise ValueError(
+            f"codes and labels differ in length: {membership.shape[0]} != {target.size}"
+        )
+    set_codes = np.asarray(codes).ravel().astype(int)
+    n = target.size
+    split = n // 2
+    report: Dict[str, float] = {}
+    for name, (start, stop) in zip(("first_half", "second_half"), ((0, split), (split, n))):
+        block_labels = target[start:stop]
+        covered = membership[start:stop][np.arange(block_labels.size), block_labels]
+        frauds = block_labels == 1
+        report[f"coverage_fraud_{name}"] = (
+            float(np.mean(covered[frauds])) if frauds.any() else float("nan")
+        )
+        report[f"triage_rate_{name}"] = (
+            float(np.mean(set_codes[start:stop] == SET_BOTH))
+            if block_labels.size
+            else float("nan")
+        )
+    return report
 
 
 def write_csv(path: str | Path, rows: Iterable[Dict[str, object]], columns: Optional[Sequence[str]] = None) -> Path:
