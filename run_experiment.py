@@ -18,23 +18,25 @@ import argparse
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 
 from src.conformal import MondrianCP, StandardSplitCP
-from src.data import SplitDataset, load_ieee_cis, load_ulb
+from src.data import DEFAULT_PROB_CAL_FRACTION, SplitDataset, load_ieee_cis, load_ulb
 from src.metrics import (
     METRIC_COLUMNS,
     aggregate_rows,
     average_precision_score,
+    brier_score,
     conformal_report,
+    ece,
     roc_auc_score,
     write_csv,
 )
-from src.models import train_and_predict
+from src.models import CALIBRATORS, train_and_predict
 from src.utils import ensure_dir, load_config, save_json, set_global_seed, utc_timestamp
-from src.visualize import plot_alpha_tradeoff
+from src.visualize import plot_alpha_tradeoff, plot_alpha_variant_tradeoff
 
 CP_REGISTRY = {"standard": StandardSplitCP, "mondrian": MondrianCP}
 
@@ -45,6 +47,8 @@ DEFAULT_METHODS = ("standard", "mondrian")
 SUMMARY_COLUMNS = (
     "dataset",
     "model",
+    "variant",
+    "calibrator",
     "method",
     "alpha",
     "n_seeds",
@@ -66,7 +70,22 @@ SUMMARY_COLUMNS = (
     "pr_auc_std",
     "roc_auc_mean",
     "roc_auc_std",
+    "brier_mean",
+    "brier_std",
+    "ece_mean",
+    "ece_std",
+    "brier_raw_mean",
+    "brier_raw_std",
+    "ece_raw_mean",
+    "ece_raw_std",
 )
+
+
+def _calibrator_of(spec: Dict[str, Any]) -> str:
+    """Read a model spec's calibrator, normalising aliases and empties."""
+    value = spec.get("calibrator", "none")
+    key = str(value if value is not None else "none").strip().lower()
+    return "none" if key in {"", "identity"} else key
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -82,7 +101,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, default=None,
                         help="root directory for CSVs and figures (default: from config)")
     parser.add_argument("--models", nargs="+", default=None,
-                        help="subset of model names in the config (e.g. --models xgboost)")
+                        help="subset of model names or variant labels in the config (e.g. --models xgboost unweighted_platt)")
     parser.add_argument("--seeds", nargs="+", type=int, default=None)
     parser.add_argument("--alphas", nargs="+", type=float, default=None)
     parser.add_argument("--no-figures", action="store_true", help="skip PNG generation")
@@ -151,7 +170,12 @@ def _resolve_settings(args: argparse.Namespace, config: Dict[str, Any]) -> Dict[
         raise SystemExit("config has no 'models' entries")
     if args.models:
         wanted = {name.lower() for name in args.models}
-        model_specs = [spec for spec in model_specs if str(spec.get("name", "")).lower() in wanted]
+        model_specs = [
+            spec
+            for spec in model_specs
+            if str(spec.get("name", "")).lower() in wanted
+            or str(spec.get("variant", "")).lower() in wanted
+        ]
         if not model_specs:
             raise SystemExit(f"no configured model matches --models {args.models}")
 
@@ -162,13 +186,64 @@ def _resolve_settings(args: argparse.Namespace, config: Dict[str, Any]) -> Dict[
         if not 0.0 < float(alpha) < 1.0:
             raise SystemExit(f"alpha must lie in (0, 1), got {alpha}")
 
+    for spec in model_specs:
+        calibrator = _calibrator_of(spec)
+        if calibrator not in CALIBRATORS:
+            raise SystemExit(
+                f"unknown calibrator {spec.get('calibrator')!r} for model "
+                f"{spec.get('name')!r}; expected one of {list(CALIBRATORS)}"
+            )
+
+    # Duplicate variant labels would be silently averaged together.
+    seen: Dict[tuple, int] = {}
+    for index, spec in enumerate(model_specs):
+        key = (str(spec.get("name", "")).lower(), str(spec.get("variant", "")))
+        if key[1] == "":
+            continue
+        if key in seen:
+            raise SystemExit(
+                f"models[{seen[key]}] and models[{index}] share the variant label {key[1]!r}; "
+                "give every ablation arm a distinct 'variant'"
+            )
+        seen[key] = index
+
+    prob_cal_fraction = _resolve_prob_cal_fraction(config, model_specs)
+
     return {
         "seeds": [int(seed) for seed in seeds],
         "alphas": [float(alpha) for alpha in alphas],
         "methods": list(methods),
         "output_dir": Path(output_dir),
         "models": model_specs,
+        "prob_cal_fraction": prob_cal_fraction,
     }
+
+
+def _resolve_prob_cal_fraction(
+    config: Dict[str, Any], model_specs: Sequence[Dict[str, Any]]
+) -> Optional[float]:
+    """One shared probability-calibration share, or ``None`` when unused.
+
+    Every calibrated arm must fit its booster on the same rows for the ablation
+    to be a comparison of weighting and calibration rather than of data volume.
+    """
+    if not any(_calibrator_of(spec) != "none" for spec in model_specs):
+        return None
+    default = float(_data_config(config).get("prob_cal_fraction", DEFAULT_PROB_CAL_FRACTION))
+    declared = {
+        float(spec.get("prob_cal_fraction", default))
+        for spec in model_specs
+        if _calibrator_of(spec) != "none"
+    }
+    if len(declared) > 1:
+        raise SystemExit(
+            "calibrated variants must share a single prob_cal_fraction so they are fit on the "
+            f"same rows, got {sorted(declared)}"
+        )
+    fraction = declared.pop()
+    if not 0.0 < fraction < 1.0:
+        raise SystemExit(f"prob_cal_fraction must lie in (0, 1), got {fraction}")
+    return fraction
 
 
 def _run_single_seed(
@@ -178,9 +253,11 @@ def _run_single_seed(
     alphas: Sequence[float],
     methods: Sequence[str],
     dataset_name: str,
+    fit_log: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Train one model and evaluate every (method, alpha) cell for one seed."""
     name = str(model_spec.get("name", "")).strip().lower()
+    calibrator = _calibrator_of(model_spec)
     prediction = train_and_predict(
         name,
         dataset.X_train,
@@ -190,10 +267,20 @@ def _run_single_seed(
         params=model_spec.get("params"),
         scale_pos_weight=model_spec.get("scale_pos_weight"),
         seed=seed,
+        calibrator=calibrator,
+        X_prob_cal=dataset.X_prob_cal,
+        y_prob_cal=dataset.y_prob_cal,
+        variant=model_spec.get("variant"),
     )
+    if fit_log is not None:
+        fit_log.append({"seed": int(seed), **prediction.describe()})
 
     pr_auc = average_precision_score(dataset.y_test, prediction.prob_test)
     roc_auc = roc_auc_score(dataset.y_test, prediction.prob_test)
+    brier = brier_score(dataset.y_test, prediction.prob_test)
+    ece_value = ece(dataset.y_test, prediction.prob_test)
+    brier_raw = brier_score(dataset.y_test, prediction.raw_prob_test)
+    ece_raw = ece(dataset.y_test, prediction.raw_prob_test)
 
     rows: List[Dict[str, Any]] = []
     for method in methods:
@@ -205,11 +292,17 @@ def _run_single_seed(
             row: Dict[str, Any] = {
                 "dataset": dataset_name,
                 "model": name,
+                "variant": prediction.variant,
+                "calibrator": calibrator,
                 "method": method,
                 "alpha": float(alpha),
                 "seed": int(seed),
                 "pr_auc": float(pr_auc),
                 "roc_auc": float(roc_auc),
+                "brier": float(brier),
+                "ece": float(ece_value),
+                "brier_raw": float(brier_raw),
+                "ece_raw": float(ece_raw),
             }
             calibration = cp.describe()
             calibration.pop("method", None)
@@ -224,19 +317,23 @@ def _print_summary(summary_rows: Sequence[Dict[str, Any]]) -> None:
     if not summary_rows:
         return
     header = (
-        f"{'model':<10} {'method':<10} {'alpha':>6} "
-        f"{'fraud_cov':>10} {'normal_cov':>11} {'triage':>8} {'empty':>7} {'pr_auc':>8}"
+        f"{'model':<10} {'variant':<20} {'method':<10} {'alpha':>6} "
+        f"{'fraud_cov':>10} {'normal_cov':>11} {'triage':>8} {'empty':>7} {'pr_auc':>8} "
+        f"{'brier':>8} {'ece':>8}"
     )
     print("\n" + header)
     print("-" * len(header))
     for row in summary_rows:
         print(
-            f"{str(row['model']):<10} {str(row['method']):<10} {float(row['alpha']):>6.3f} "
+            f"{str(row['model']):<10} {str(row.get('variant') or '-'):<20} "
+            f"{str(row['method']):<10} {float(row['alpha']):>6.3f} "
             f"{float(row['coverage_fraud_mean']):>10.4f} "
             f"{float(row['coverage_normal_mean']):>11.4f} "
             f"{float(row['triage_rate_mean']):>8.4f} "
             f"{float(row['empty_rate_mean']):>7.4f} "
-            f"{float(row['pr_auc_mean']):>8.4f}"
+            f"{float(row['pr_auc_mean']):>8.4f} "
+            f"{float(row['brier_mean']):>8.4f} "
+            f"{float(row['ece_mean']):>8.4f}"
         )
 
 
@@ -252,12 +349,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     settings = _resolve_settings(args, config)
     dataset = load_dataset(args.dataset, config, args.data_path)
 
+    if settings["prob_cal_fraction"] is not None:
+        # Carve the probability-calibration block out of the training window
+        # before any booster is fit; the conformal calibration block stays
+        # untouched and only supplies quantiles.
+        dataset = dataset.with_prob_cal_split(settings["prob_cal_fraction"])
+
     print(f"[info] dataset       : {dataset.name}")
-    for block in ("train", "calibration", "test"):
-        stats = dataset.summary()[block]
+    for block in ("train", "prob_cal", "calibration", "test"):
+        stats = dataset.summary().get(block)
+        if not stats:
+            continue
         print(
             f"[info] {block:<11}: {stats['n']:>8,} rows, "
             f"{stats['n_fraud']:>6,} fraud ({stats['prevalence']:.4%})"
+        )
+    if dataset.has_prob_cal:
+        print(
+            "[info] probability calibration is fit on 'prob_cal' only; "
+            "conformal quantiles stay on 'calibration'"
         )
 
     run_root = ensure_dir(settings["output_dir"] / dataset_name)
@@ -265,19 +375,50 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     started = time.time()
     rows: List[Dict[str, Any]] = []
+    fit_log: List[Dict[str, Any]] = []
+    failures: List[Dict[str, Any]] = []
     for model_spec in settings["models"]:
         model_name = str(model_spec.get("name", "")).strip().lower()
-        for seed in settings["seeds"]:
+        variant_label = str(model_spec.get("variant") or "")
+        for position, seed in enumerate(settings["seeds"]):
             set_global_seed(seed)
-            seed_rows = _run_single_seed(
-                dataset, model_spec, seed, settings["alphas"], settings["methods"], dataset_name
-            )
+            try:
+                seed_rows = _run_single_seed(
+                    dataset,
+                    model_spec,
+                    seed,
+                    settings["alphas"],
+                    settings["methods"],
+                    dataset_name,
+                    fit_log=fit_log if position == 0 else None,
+                )
+            except Exception as error:  # noqa: BLE001 - one arm must not kill the sweep
+                # A long ablation should not lose the arms that already finished
+                # because one estimator could not be imported or trained.
+                message = f"{type(error).__name__}: {error}"
+                print(f"[warn] skipping {model_name} {variant_label or '-'} seed={seed}: {message}")
+                failures.append(
+                    {
+                        "model": model_name,
+                        "variant": variant_label,
+                        "seed": int(seed),
+                        "error": message,
+                    }
+                )
+                break
             rows.extend(seed_rows)
             best = max(seed_rows, key=lambda row: row["pr_auc"])
             print(
-                f"[run ] {model_name:<9} seed={seed} "
-                f"pr_auc={best['pr_auc']:.4f} roc_auc={best['roc_auc']:.4f}"
+                f"[run ] {model_name:<9} {best['variant']:<20} seed={seed} "
+                f"pr_auc={best['pr_auc']:.4f} roc_auc={best['roc_auc']:.4f} "
+                f"brier={best['brier']:.5f} ece={best['ece']:.5f}"
             )
+
+    if not rows:
+        raise SystemExit(
+            "no arm produced results; first failure: "
+            + (failures[0]["error"] if failures else "unknown")
+        )
 
     per_seed_path = write_csv(run_root / "per_seed_metrics.csv", rows, METRIC_COLUMNS)
     summary = aggregate_rows(rows)
@@ -285,15 +426,39 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     figures: List[str] = []
     if not args.no_figures:
+        # One figure per model.  With more than one ablation arm the figure has
+        # to compare variants, with a single arm the base scheme comparison is
+        # still the informative plot.
+        plotted: List[str] = []
         for model_spec in settings["models"]:
             model_name = str(model_spec.get("name", "")).strip().lower()
+            if model_name in plotted:
+                continue
+            plotted.append(model_name)
+            variants = [
+                str(spec.get("variant") or "")
+                for spec in settings["models"]
+                if str(spec.get("name", "")).strip().lower() == model_name
+            ]
+            variants = [variant for variant in dict.fromkeys(variants) if variant]
             model_rows = [row for row in summary if row["model"] == model_name]
             if not model_rows:
                 continue
             try:
-                paths = plot_alpha_tradeoff(
-                    model_rows, figure_dir, dataset=dataset_name, model=model_name
-                )
+                if len(variants) > 1:
+                    primary_method = "mondrian" if "mondrian" in settings["methods"] else settings["methods"][0]
+                    paths = plot_alpha_variant_tradeoff(
+                        model_rows,
+                        figure_dir,
+                        dataset=dataset_name,
+                        model=model_name,
+                        method=primary_method,
+                        variants=variants,
+                    )
+                else:
+                    paths = plot_alpha_tradeoff(
+                        model_rows, figure_dir, dataset=dataset_name, model=model_name
+                    )
             except RuntimeError as error:
                 print(f"[warn] skipping figures: {error}")
                 break
@@ -308,7 +473,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         "alphas": settings["alphas"],
         "methods": settings["methods"],
         "models": [str(spec.get("name")) for spec in settings["models"]],
+        "variants": [str(spec.get("variant") or "") for spec in settings["models"]],
+        "calibrators": [_calibrator_of(spec) for spec in settings["models"]],
+        "prob_cal_fraction": settings["prob_cal_fraction"],
         "dataset_summary": dataset.summary(),
+        "fits": fit_log,
+        "failures": failures,
         "n_runs": len(rows),
         "outputs": {
             "per_seed_metrics": str(per_seed_path),
@@ -319,6 +489,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     save_json(run_root / "run_metadata.json", metadata)
 
     _print_summary(summary)
+    if failures:
+        print(f"\n[warn] {len(failures)} arm(s) were skipped:")
+        for failure in failures:
+            print(
+                f"       {failure['model']} {failure['variant'] or '-'} "
+                f"seed={failure['seed']}: {failure['error']}"
+            )
     print(f"\n[done] per-seed metrics : {per_seed_path}")
     print(f"[done] summary metrics  : {summary_path}")
     for figure in figures:
