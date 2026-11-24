@@ -6,6 +6,19 @@ therefore sorts by the dataset's own timestamp and cuts the data
 chronologically into ``train / calibration / test`` blocks.  All fitted
 preprocessing (frequency maps, sentinel fill values) is estimated on the
 training block only.
+
+Optional fourth block: probability calibration
+---------------------------------------------
+A post-hoc probability calibrator (Platt scaling, isotonic regression) is a
+fitted model and must not see the conformal calibration scores either: fitting
+it on the same block that supplies the conformal quantile would break the
+exchangeability the guarantee relies on.  ``SplitDataset.with_prob_cal_split``
+carves the *tail* of the training block (the most recent rows the booster was
+fit on, typically the last 15 %) into a separate ``prob_cal`` block.  The
+boosters are then refit on the remaining head of the training block, the
+calibrator is fit on ``prob_cal`` and the conformal quantiles stay on the
+untouched ``cal`` block.  Time order is preserved at every step:
+``train_fit < prob_cal < calibration < test``.
 """
 
 from __future__ import annotations
@@ -19,14 +32,19 @@ import numpy as np
 
 __all__ = [
     "DEFAULT_FRACTIONS",
+    "DEFAULT_PROB_CAL_FRACTION",
     "SplitDataset",
     "load_ieee_cis",
     "load_ulb",
+    "split_train_tail_indices",
     "temporal_split_indices",
 ]
 
 #: ``train / calibration / test`` proportions of the time-ordered data.
 DEFAULT_FRACTIONS: Tuple[float, float, float] = (0.60, 0.20, 0.20)
+
+#: Share of the training block held out for post-hoc probability calibration.
+DEFAULT_PROB_CAL_FRACTION: float = 0.15
 
 
 @dataclass
@@ -36,6 +54,10 @@ class SplitDataset:
     Feature matrices are ``float32`` numpy arrays; the calibration block is
     kept separate because conformal quantiles must not be estimated on data
     the model was trained on.
+
+    ``X_prob_cal`` / ``y_prob_cal`` are only populated when a post-hoc
+    probability calibrator is used; they hold the most recent tail of the
+    training window (see ``with_prob_cal_split``).
     """
 
     name: str
@@ -47,6 +69,51 @@ class SplitDataset:
     y_test: np.ndarray
     feature_names: List[str] = field(default_factory=list)
     meta: Dict[str, object] = field(default_factory=dict)
+    X_prob_cal: Optional[np.ndarray] = None
+    y_prob_cal: Optional[np.ndarray] = None
+
+    @property
+    def has_prob_cal(self) -> bool:
+        """Whether a separate probability-calibration block exists."""
+        return self.X_prob_cal is not None and self.y_prob_cal is not None
+
+    def with_prob_cal_split(
+        self, fraction: float = DEFAULT_PROB_CAL_FRACTION
+    ) -> "SplitDataset":
+        """Return a copy whose training block is cut into ``train_fit / prob_cal``.
+
+        The ``prob_cal`` block is the chronologically *last* ``fraction`` of
+        the current training rows, so it sits strictly between the model's fit
+        window and the conformal calibration window.  ``X_cal``, ``y_cal``,
+        ``X_test`` and ``y_test`` are carried over unchanged: the conformal
+        quantiles keep using the same rows.  Every array is copied, so no
+        downstream in-place edit can reach back into the original split.
+        """
+        if self.has_prob_cal:
+            raise ValueError("dataset already has a prob_cal block")
+        fit_idx, prob_idx = split_train_tail_indices(len(self.y_train), fraction)
+
+        meta = dict(self.meta)
+        meta["prob_cal_fraction"] = float(fraction)
+        meta["prob_cal_split"] = {
+            "source": "tail of the training block",
+            "n_fit": int(fit_idx.size),
+            "n_prob_cal": int(prob_idx.size),
+            "n_prob_cal_fraud": int(np.sum(self.y_train[prob_idx] == 1)),
+        }
+        return SplitDataset(
+            name=self.name,
+            X_train=self.X_train[fit_idx].copy(),
+            y_train=self.y_train[fit_idx].copy(),
+            X_cal=self.X_cal.copy(),
+            y_cal=self.y_cal.copy(),
+            X_test=self.X_test.copy(),
+            y_test=self.y_test.copy(),
+            feature_names=list(self.feature_names),
+            meta=meta,
+            X_prob_cal=self.X_train[prob_idx].copy(),
+            y_prob_cal=self.y_train[prob_idx].copy(),
+        )
 
     def summary(self) -> Dict[str, object]:
         """Counts, prevalence and split sizes, for logging and run metadata."""
@@ -58,14 +125,19 @@ class SplitDataset:
                 "prevalence": positives / max(y.size, 1),
             }
 
-        return {
+        payload: Dict[str, object] = {
             "dataset": self.name,
             "n_features": len(self.feature_names),
             "train": block(self.y_train),
             "calibration": block(self.y_cal),
             "test": block(self.y_test),
-            **self.meta,
         }
+        if self.has_prob_cal:
+            # ``train`` above already describes the refit (fit) block; the
+            # prob_cal block is reported next to it for auditing.
+            payload["prob_cal"] = block(self.y_prob_cal)  # type: ignore[arg-type]
+        payload.update(self.meta)
+        return payload
 
 
 def _validate_fractions(fractions: Sequence[float]) -> Tuple[float, float, float]:
@@ -108,6 +180,30 @@ def temporal_split_indices(
     calibration = np.arange(n_train, n_train + n_cal)
     test = np.arange(n_train + n_cal, n)
     return train, calibration, test
+
+
+def split_train_tail_indices(
+    n_train: int,
+    fraction: float = DEFAULT_PROB_CAL_FRACTION,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Split a training block into ``(fit, prob_cal)`` chronological indices.
+
+    ``prob_cal`` is the last ``fraction`` of the rows, so a calibrator fit on
+    it only ever sees data that is *older* than the conformal calibration and
+    test windows.  At least one row is kept on each side.
+    """
+    n = int(n_train)
+    share = float(fraction)
+    if not 0.0 < share < 1.0:
+        raise ValueError(f"prob_cal fraction must lie strictly between 0 and 1, got {fraction!r}")
+    if n < 2:
+        raise ValueError(f"need at least 2 training rows to hold out a prob_cal block, got {n}")
+
+    n_prob = int(np.floor(share * n))
+    n_prob = min(max(n_prob, 1), n - 1)
+    fit = np.arange(0, n - n_prob)
+    prob = np.arange(n - n_prob, n)
+    return fit, prob
 
 
 def _to_float32(matrix: np.ndarray, fill_value: float = 0.0) -> np.ndarray:
