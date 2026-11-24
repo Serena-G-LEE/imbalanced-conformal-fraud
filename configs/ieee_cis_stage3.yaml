@@ -1,0 +1,63 @@
+# Stage 3 on IEEE-CIS: adaptive Mondrian CP (ACI) against the two static schemes.
+#
+# IEEE-CIS is the dataset that motivates stage 3: with a real time axis and
+# ~3.5 % fraud, static Mondrian CP under-covers fraud by three to four points at
+# alpha = 0.05 (91.1 % - 92.1 % against a 95 % target) because exchangeability
+# breaks across TransactionDT.  This config asks whether letting the two levels
+# move online closes that gap.
+#
+# Identical protocol to configs/ulb_stage3.yaml, with the stage-2 IEEE-CIS
+# booster parameters (600 trees) and the stage-2 winning arm `unweighted_raw`.
+#
+#   python run_experiment.py --dataset ieee_cis --config configs/ieee_cis_stage3.yaml
+
+dataset: ieee_cis
+
+data:
+  dir_path: data/ieee_cis
+  transaction_file: train_transaction.csv
+  identity_file: train_identity.csv
+  time_column: TransactionDT
+  label_column: isFraud
+  log1p_amount: true
+  fill_value: -1.0
+  splits:
+    train: 0.60
+    calibration: 0.20
+    test: 0.20
+
+models:
+  - name: xgboost
+    variant: unweighted_raw
+    scale_pos_weight: 1.0
+    calibrator: none
+    params:
+      n_estimators: 600
+      max_depth: 6
+      learning_rate: 0.05
+      subsample: 0.8
+      colsample_bytree: 0.6
+      min_child_weight: 2.0
+      reg_lambda: 2.0
+      tree_method: hist
+
+  - name: lightgbm
+    variant: unweighted_raw
+    scale_pos_weight: 1.0
+    calibrator: none
+    params:
+      n_estimators: 600
+      num_leaves: 63
+      learning_rate: 0.05
+      subsample: 0.8
+      subsample_freq: 1
+      colsample_bytree: 0.6
+      min_child_samples: 40
+      reg_lambda: 2.0
+
+experiment:
+  seeds: [42, 43, 44, 45, 46]
+  alpha_grid: [0.01, 0.03, 0.05, 0.10]
+  methods: [standard, mondrian, adaptive_mondrian]
+  aci_gamma: 0.005
+  output_dir: results
