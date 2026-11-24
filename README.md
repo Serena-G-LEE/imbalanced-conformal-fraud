@@ -28,6 +28,9 @@ measured quantity at a chosen coverage level instead of a by-product of threshol
   training block only, model never sees the calibration or test window.
 - **Seeded multi-run reporting.** Every `(model, method, alpha)` cell is reported as mean ± standard
   deviation over five seeds, with per-seed CSVs kept for auditing.
+- **Two-stage protocol.** A stage-2 calibration ablation compares class re-weighting (`scale_pos_weight`)
+  against post-hoc probability calibration (Platt / isotonic) on a leakage-free `prob_cal` split, with
+  Brier score and expected calibration error reported next to the triage metrics.
 - **Lightweight tests.** The conformal layer is unit tested with `numpy` and `unittest` only, so the
   mathematics can be verified without the boosters installed.
 
@@ -112,18 +115,21 @@ Implementation notes:
 imbalanced-conformal-fraud
 ├── configs
 │   ├── ulb.yaml                 # ULB paths, chronological split, seeds, alpha grid, model params
-│   └── ieee_cis.yaml            # IEEE-CIS config (transaction + identity join), same schema
+│   ├── ieee_cis.yaml            # IEEE-CIS config (transaction + identity join), same schema
+│   ├── ulb_ablation.yaml        # stage-2 sweep: weighted / unweighted x none / platt / isotonic
+│   └── ieee_cis_ablation.yaml   # stage-2 sweep on IEEE-CIS, same schema
 ├── src
 │   ├── __init__.py              # package metadata
 │   ├── conformal.py             # StandardSplitCP, MondrianCP, score and quantile helpers
-│   ├── data.py                  # chronological 3-way split; ULB and IEEE-CIS loaders
-│   ├── metrics.py               # PR-AUC, ROC-AUC, coverage / triage metrics, CSV IO, seed aggregation
-│   ├── models.py                # XGBoost / LightGBM behind one train-and-score interface
+│   ├── data.py                  # chronological 4-way split; ULB and IEEE-CIS loaders
+│   ├── metrics.py               # PR-AUC, ROC-AUC, Brier, ECE, coverage / triage metrics, CSV IO
+│   ├── models.py                # XGBoost / LightGBM + Platt and isotonic calibrators
 │   ├── utils.py                 # seeding, YAML config loading, output directories
-│   └── visualize.py             # alpha vs. fraud-coverage / review-rate trade-off figures
+│   └── visualize.py             # alpha trade-off figures (per scheme and per ablation variant)
 ├── tests
 │   ├── test_conformal.py        # quantile, four set types, class-conditional coverage (numpy only)
 │   ├── test_metrics.py          # PR-AUC / ROC-AUC vs. brute force, coverage accounting
+│   ├── test_calibration.py      # Brier, ECE, Platt / isotonic, prob_cal split, leakage guards
 │   └── test_data.py             # temporal split arithmetic, chronological ordering
 ├── run_experiment.py            # CLI: models × seeds × methods × alphas -> CSVs + figures
 ├── requirements.txt
@@ -148,7 +154,9 @@ pip install -r requirements.txt
 ```
 
 Python 3.9+ is required. The conformal layer and its tests need only `numpy`; `pandas`, `PyYAML`,
-`matplotlib`, `xgboost` and `lightgbm` are needed for the full pipeline.
+`matplotlib`, `xgboost` and `lightgbm` are needed for the full pipeline. `scikit-learn` is installed as
+well because `XGBClassifier` / `LGBMClassifier` refuse to run without it — it is not used by the
+conformal or calibration code, which stay numpy-only.
 
 ### 2. Prepare Datasets
 
@@ -206,7 +214,7 @@ python run_experiment.py --dataset ulb --no-figures
 | `--config` | `configs/<dataset>.yaml` | experiment config |
 | `--data-path` | from config | ULB: path to `creditcard.csv`; IEEE-CIS: directory holding the CSVs |
 | `--output-dir` | `results` | root output directory |
-| `--models` | all in config | subset of configured model names |
+| `--models` | all in config | subset of configured model names **or variant labels** |
 | `--seeds` | `42 43 44 45 46` | random seeds |
 | `--alphas` | `0.01 0.03 0.05 0.10` | target miscoverage levels |
 | `--no-figures` | off | skip PNG generation |
@@ -222,7 +230,13 @@ data:
 models:
   - name: xgboost
     scale_pos_weight: auto          # negatives / positives in the training block
+    calibrator: none                # none | platt | isotonic
+    variant: weighted_raw           # ablation label; defaults to weighted_<calibrator>
     params: {n_estimators: 400, max_depth: 4, learning_rate: 0.05}
+  - name: xgboost
+    scale_pos_weight: 1.0           # no re-weighting
+    calibrator: platt
+    variant: unweighted_platt
 experiment:
   seeds: [42, 43, 44, 45, 46]
   alpha_grid: [0.01, 0.03, 0.05, 0.10]
@@ -230,12 +244,84 @@ experiment:
   output_dir: results
 ```
 
+`data.prob_cal_fraction` (default `0.15`) is only used when at least one model declares
+`calibrator: platt|isotonic`; it is described in the next section.
+
+### 4. Stage-2 calibration ablation
+
+The base run answers "which calibration scheme keeps fraud coverage at the nominal level". It leaves open a
+second question: *is the review queue as large as it is because the model's probabilities are on the wrong
+scale?* `scale_pos_weight: auto` multiplies the positive class by `negatives / positives` (≈ 578 on ULB),
+which minimises a re-weighted likelihood and pushes every predicted probability far above the true fraud
+rate. The ablation crosses that choice with post-hoc probability calibration:
+
+```bash
+# ULB: 2 boosters x 5 arms x 5 seeds x 2 schemes x 4 alphas
+python run_experiment.py --dataset ulb --config configs/ulb_ablation.yaml
+
+# IEEE-CIS (10 arms x 600 trees is long; start with two arms and two seeds)
+python run_experiment.py --dataset ieee_cis --config configs/ieee_cis_ablation.yaml \
+    --models unweighted_raw unweighted_platt --seeds 42 43 --no-figures
+
+# only the re-weighting question, all seeds
+python run_experiment.py --dataset ulb --config configs/ulb_ablation.yaml \
+    --models weighted_raw unweighted_raw
+```
+
+Arms in both ablation configs (`weighted_raw`, `unweighted_raw`, `unweighted_platt`,
+`unweighted_isotonic`, `weighted_platt`):
+
+| Variant | `scale_pos_weight` | `calibrator` | What it isolates |
+| --- | --- | --- | --- |
+| `weighted_raw` | `auto` | `none` | the stage-1 default: inflated odds, no repair |
+| `unweighted_raw` | `1.0` | `none` | the cost of re-weighting, as seen by the score |
+| `unweighted_platt` | `1.0` | `platt` | effect of a parametric recalibration on an already-sane score |
+| `unweighted_isotonic` | `1.0` | `isotonic` | same, with a flexible (tie-producing) map |
+| `weighted_platt` | `auto` | `platt` | repairing the inflated score after the fact |
+
+**Leakage-free `prob_cal` split.** A calibrator is a fitted model, so it may not see the conformal
+calibration scores either. When any arm declares a calibrator, the most recent `data.prob_cal_fraction`
+(15 %) of the *training* window is carved out as `prob_cal`:
+
+```
+train_fit (oldest 85 % of the train block)  ->  booster fit
+train_fit .. prob_cal (15 %)               ->  Platt / isotonic fit
+calibration (20 %, untouched)              ->  conformal quantiles only
+test (newest 20 %)                         ->  every reported number
+```
+
+Every arm is fit on the same `train_fit` rows and scored on the same `calibration` / `test` rows, so the
+comparison is about re-weighting and calibration, not about how much data each arm saw. The stage-1
+configs have no calibrator and keep the original three-block split unchanged.
+
+**How to read it.** Two effects have to be separated, and one of them is structural:
+
+- *Probability quality.* `brier` and `ece` are computed on the test block from the scores the conformal
+  layer uses (`brier_raw` / `ece_raw` from the booster output). `weighted_raw` should sit well above
+  `*_platt` on both; a Platt fit on the inflated score recovers the true scale, and the isotonic map
+  recovers it non-parametrically.
+- *Review queue.* `triage_rate` for **Mondrian** CP cannot move under a strictly increasing
+  recalibration: each class-conditional threshold is a quantile of one monotone function of `p` per
+  stratum, so the threshold moves with the scores and every membership test keeps its answer. This is
+  asserted in `tests/test_calibration.py`. Pooled **standard** CP is the exception — its single
+  threshold is a quantile of a vector that mixes `p` (legitimate scores) with `1 - p` (fraud scores), so
+  a non-linear map reorders it, and its sets (mostly its `empty_rate`) do move. An isotonic fit can also
+  move Mondrian sets slightly, because its plateaus create ties that widen the sets.
+
+So the honest reading is: if a `weighted_*` model has a large review queue and its `*_platt` twin has the
+same queue with a much lower Brier/ECE, the queue was **not** a probability-scale problem — it is the
+model fit (the ranking) that the re-weighting changed, and recalibration alone cannot buy back review
+capacity. That is exactly the negative control the stage-2 experiment is for.
+
 ## Evaluation Metrics
 
 | Metric | Definition | Reported in |
 | --- | --- | --- |
 | `pr_auc` | average precision of the fraud probability on the test block | `per_seed_metrics.csv`, `summary_metrics.csv` |
 | `roc_auc` | ROC-AUC (Mann-Whitney, ties = 0.5) | same |
+| `brier` | Brier score `mean((p - y)^2)` of the score the conformal layer uses | same |
+| `ece` | expected calibration error, equal-mass (quantile) bins, `sum_b n_b/n |acc_b - conf_b|` | same |
+| `brier_raw`, `ece_raw` | the same two, computed on the uncalibrated booster output | same |
 | `coverage` | share of test transactions whose true label is inside the prediction set | same |
 | `coverage_normal`, `coverage_fraud` | the same computed inside each class — the quantity Mondrian CP protects | same |
 | `triage_rate` | share of transactions in `{0, 1}`, i.e. the manual review workload | same |
@@ -250,27 +336,36 @@ experiment:
 `triage_rate` is the operational cost curve: at a fixed fraud-coverage target, the calibration scheme
 with the lower `triage_rate` is the one an operations team wants.
 
+`ece` uses equal-mass bins by default (`strategy="quantile"`). At a 0.172 % fraud rate a uniform 15-bin
+split over `[0, 1]` puts every transaction in the first bin, where the metric collapses to
+`|prevalence - mean score|` and stops seeing the ranking; `src.metrics.ece` still accepts
+`strategy="uniform"` for comparison.
+
 ## Expected Outputs
 
 ```
 results/<dataset>/
-├── per_seed_metrics.csv     # one row per model × seed × method × alpha (31 columns)
-├── summary_metrics.csv      # mean / std across seeds for every `(model, method, alpha)`
-├── run_metadata.json        # config used, split sizes, prevalence, timestamp, elapsed time
+├── per_seed_metrics.csv     # one row per model × variant × seed × method × alpha (37 columns)
+├── summary_metrics.csv      # mean / std across seeds for every `(model, variant, method, alpha)`
+├── run_metadata.json        # config, split sizes, prevalence, calibrator fits, timestamp, elapsed
 └── figures/
-    └── <dataset>_<model>_alpha_tradeoff.png
+    ├── <dataset>_<model>_alpha_tradeoff.png       # stage 1: scheme comparison
+    └── <dataset>_<model>_ablation_tradeoff.png    # stage 2: one line per variant
 ```
 
-`summary_metrics.csv` is the table to read. For each `(model, method, alpha)` it reports
+`summary_metrics.csv` is the table to read. For each `(model, variant, method, alpha)` it reports
 `coverage_fraud_mean/std`, `coverage_normal_mean/std`, `coverage_mean/std`, `triage_rate_mean/std`,
 `empty_rate_mean/std`, `fraud_triage_capture_mean`, `mean_set_size_mean`,
-`singleton_fraud_precision_mean`, `singleton_fraud_recall_mean`, `pr_auc_mean/std` and
-`roc_auc_mean/std`.
+`singleton_fraud_precision_mean`, `singleton_fraud_recall_mean`, `pr_auc_mean/std`,
+`roc_auc_mean/std`, `brier_mean/std`, `ece_mean/std`, `brier_raw_mean/std` and `ece_raw_mean/std`.
 
 Each figure has two panels: empirical fraud coverage against the nominal `1 − α` reference line on the
 left, and the share of transactions in `{0, 1}` on the right, both with seed-standard-deviation error
 bars. The expected reading is a flat standard-CP curve far below the diagonal, a Mondrian curve that
 tracks `1 − α`, and a review rate that rises as `α` is tightened — the cost of keeping the guarantee.
+The ablation figure repeats it with one line per variant at a fixed scheme (Mondrian by default), so
+`weighted_raw` versus `unweighted_raw` shows what re-weighting does to the queue and `*_platt` overlays
+whether recalibration changed it.
 
 ## Tests
 
@@ -282,14 +377,20 @@ The suite covers the finite-sample quantile (order statistic, ceiling rule, `1.0
 hand-computed thresholds for both calibration schemes, all four prediction-set outcomes, class-conditional
 coverage on a 0.3 %-positive synthetic problem (pooled CP collapses on fraud, Mondrian CP does not),
 PR-AUC and ROC-AUC against brute-force pairwise computation, the CSV / aggregation layer, and the
-temporal split arithmetic. Only `numpy` is required; the pandas-backed loader test is skipped when
-pandas is absent.
+temporal split arithmetic. `tests/test_calibration.py` adds the probability-calibration layer: Brier and
+ECE against hand-computed values, monotonicity and `out_of_bounds="clip"` behaviour of both calibrators,
+the chronological `prob_cal` split (no overlap with `calibration`, arrays copied), the leakage guards
+(`calibrator` without a `prob_cal` block, `X_prob_cal is X_cal`), and the invariance result — a strictly
+increasing recalibration leaves Mondrian prediction sets unchanged while the pooled standard threshold
+moves. Only `numpy` is required; the pandas-backed loader test is skipped when pandas is absent.
 
 ## Experimental Protocol and Reproducibility
 
 - **Chronological split, not random.** The model trains on the oldest 60 % of transactions, conformal
   quantiles are calibrated on the next 20 %, and every reported number comes from the newest 20 %. A
-  random split would leak future information into calibration.
+  random split would leak future information into calibration. In the calibration ablation the oldest
+  85 % of that training window is the fit block and its last 15 % is `prob_cal`, so the calibrator sees
+  only data the booster has already been fit on and that the conformal quantile never uses.
 - **Preprocessing is fit on the training block only** (IEEE-CIS frequency encoding, missing-value
   sentinels), so no statistic crosses the split boundary.
 - **Seeds affect only the booster** (subsampling, column sampling). Conformal thresholds are
@@ -313,6 +414,10 @@ outputs stay out of version control. Full rules, including commit conventions, a
 
 - Binary sets only: `{0, 1}` is the whole ambiguity budget. Weighted CP or conformal risk control could
   bound a *cost* (review price × volume) directly instead of a coverage rate.
+- Recalibration is only as good as its block: `prob_cal` is 15 % of the training window, which on ULB is
+  a few hundred positives and on IEEE-CIS a few thousand. A quantile-of-score diagnostic (vary
+  `prob_cal_fraction` and watch the Brier / ECE spread) is the natural follow-up, as is temperature
+  scaling fit by cross-validation inside `train_fit`.
 - Static calibration: quantiles are fit once on a 20 % window. Online / adaptive CP is the natural
   response to concept drift.
 - No label delay: real chargebacks arrive weeks after the transaction, so calibration labels here are
