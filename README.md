@@ -121,7 +121,7 @@ imbalanced-conformal-fraud
 ├── src
 │   ├── __init__.py              # package metadata
 │   ├── conformal.py             # StandardSplitCP, MondrianCP, score and quantile helpers
-│   ├── data.py                  # chronological 4-way split; ULB and IEEE-CIS loaders
+│   ├── data.py                  # chronological split (+ optional prob_cal block); ULB and IEEE-CIS loaders
 │   ├── metrics.py               # PR-AUC, ROC-AUC, Brier, ECE, coverage / triage metrics, CSV IO
 │   ├── models.py                # XGBoost / LightGBM + Platt and isotonic calibrators
 │   ├── utils.py                 # seeding, YAML config loading, output directories
