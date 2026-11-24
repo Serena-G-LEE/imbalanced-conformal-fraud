@@ -17,8 +17,9 @@ class-conditional guarantee `P(Y ∈ C(X) | Y = y) ≥ 1 − α` and thereby mak
 measured quantity at a chosen coverage level instead of a by-product of threshold tuning. The second
 claim is that this guarantee is only as good as the window it was calibrated in: on a chronological
 test stream the score distribution moves, a static Mondrian split under-covers the minority class by
-three to four points, and letting the two class-conditional levels move online (ACI) closes most of
-that gap — at a review cost that is measured rather than assumed.
+three to four points, and letting the two class-conditional levels move online (ACI) closes all but 0.2
+of a percentage point of that gap — at a review cost that is measured rather than assumed
+(see the [stage-3 results](#results-5-seed-stage-3-at-alpha--005)).
 
 ---
 
@@ -40,6 +41,10 @@ that gap — at a review cost that is measured rather than assumed.
   probability calibration (Platt / isotonic) on a leakage-free `prob_cal` split; stage 3 adds the
   adaptive level and separates the older and newer half of the test stream, so a coverage loss from
   temporal drift is attributable to *when* it happened.
+- **Stage 3 is measured, not asserted.** Class-conditional ACI lifts IEEE-CIS fraud coverage from
+  90.5 % – 92.4 % to 94.8 % (95.0 % in the newer half of the stream) for 12.9 – 17.2 points of extra
+  review queue, and on ULB — where nothing drifts — it spends the over-coverage instead and cuts
+  LightGBM's queue from 22.9 % to 13.8 %.
 - **Lightweight tests.** The conformal layer is unit tested with `numpy` and `unittest` only, so the
   mathematics can be verified without the boosters installed.
 
@@ -548,13 +553,86 @@ How to read a stage-3 run:
   stream is asking for coverage no fixed quantile can deliver; that is the honest signal that the
   *score* broke, not the calibration, and it is the case for a new model rather than a wider threshold.
 
-Numbers for stage 3 are produced by those two commands on the machine that owns the data, as with stage
-2; this README does not carry a stage-3 results table, because a table whose provenance is a run you
-cannot repeat is worse than no table. The *mechanism* is what the repository can pin down, and it is
-pinned by tests: `tests/test_stage3_aci.py` runs a synthetic stream whose fraud scores decay over time
-and asserts that static Mondrian coverage falls to 84 – 92 % at `alpha = 0.05` while the adaptive scheme
-recovers to at least 93 % on every seed, with the legitimate level staying within two points of nominal
-so the review queue is not widened for a class that did not drift.
+### Results: 5-seed Stage-3 at `alpha = 0.05`
+
+Both tables are the `alpha = 0.05` slice (nominal 95 % coverage) of the runs driven by
+`configs/ulb_stage3.yaml` and `configs/ieee_cis_stage3.yaml`: three schemes × two boosters × five seeds
+(`42–46`) on the stage-2 winning arm (`unweighted_raw`), every number evaluated on the newest 20 % test
+block of the chronological split. Values are the mean over the five seeds, and the seed standard
+deviation of every column sits in the matching `<dataset>_summary_metrics.csv`.
+
+Within a model the score is identical in all three rows (PR-AUC 0.505 / 0.500 for LightGBM / XGBoost on
+IEEE-CIS, 0.790 / 0.793 on ULB), so every difference below is a difference the calibration scheme
+makes and nothing else.
+
+```bash
+python run_experiment.py --dataset ulb --config configs/ulb_stage3.yaml
+python run_experiment.py --dataset ieee_cis --config configs/ieee_cis_stage3.yaml
+```
+
+#### ULB (0.172 % fraud, 284,807 transactions)
+
+| Model | Method | Fraud coverage | Normal coverage | Triage rate | Late-half fraud coverage |
+| --- | --- | --- | --- | --- | --- |
+| LightGBM | `standard` | 0.27 % | 96.2 % | 0.0 % | 0.9 % |
+| LightGBM | `mondrian` | 98.4 % | 96.1 % | 22.9 % | 98.2 % |
+| LightGBM | `adaptive_mondrian` | **94.9 %** | **95.0 %** | **13.8 %** | 91.8 % |
+| XGBoost | `standard` | 0.0 % | 96.0 % | 0.0 % | 0.0 % |
+| XGBoost | `mondrian` | 95.2 % | 95.9 % | 13.3 % | 91.8 % |
+| XGBoost | `adaptive_mondrian` | **94.4 %** | **95.0 %** | **11.0 %** | 91.8 % |
+
+#### IEEE-CIS (≈3.5 % fraud, temporal `TransactionDT` split)
+
+| Model | Method | Fraud coverage | Normal coverage | Triage rate | Late-half fraud coverage |
+| --- | --- | --- | --- | --- | --- |
+| LightGBM | `standard` | 21.8 % | 97.4 % | 0.0 % | 22.8 % |
+| LightGBM | `mondrian` | 90.5 % | 94.5 % | 32.4 % | 90.5 % |
+| LightGBM | `adaptive_mondrian` | **94.8 %** | **95.0 %** | 49.6 % | **95.0 %** |
+| XGBoost | `standard` | 20.6 % | 97.4 % | 0.0 % | 21.4 % |
+| XGBoost | `mondrian` | 92.4 % | 94.4 % | 35.6 % | 92.9 % |
+| XGBoost | `adaptive_mondrian` | **94.8 %** | **95.0 %** | 48.4 % | **95.0 %** |
+
+**What the two datasets say.**
+
+1. **On IEEE-CIS the adaptive level closes the class-conditional gap, and it is the newer half that
+   moves.** Static Mondrian fraud coverage (90.5 % LightGBM, 92.4 % XGBoost) becomes 94.8 % for both
+   boosters — 0.2 %p under nominal — while normal coverage lands on 95.0 %. The recovery is not bought
+   by over-covering the old window: the newer half of the stream goes from 90.5 % / 92.9 % to 95.0 %,
+   which is where the static scheme's loss actually lived. The whole grid behaves the same way, with
+   ACI landing within 0.35 %p of `1 − α` for both classes at every level: 98.8 – 98.9 % at 0.01,
+   96.9 % at 0.03, 94.8 % at 0.05 and 89.7 – 89.8 % at 0.10.
+2. **The price is a queue, and it is paid in proportion to the errors.** Triage rate rises from 32.4 %
+   to 49.6 % on LightGBM (+17.2 %p) and from 35.6 % to 48.4 % on XGBoost (+12.9 %p) at `alpha = 0.05`;
+   across the four levels the bill runs from +8.0 to +18.6 %p. `alpha_final_fraud` ends at 0.016 /
+   0.018 and `alpha_final_normal` at 0.047 / 0.045 — the fraud level is the one that had to be cut to
+   buy coverage back, which is the signature of a stream that keeps missing frauds and of nothing else.
+3. **On ULB there is no drift to buy back, so ACI spends the over-coverage instead.** Static Mondrian
+   covers 98.4 % (LightGBM) and 95.2 % (XGBoost) of fraud at a 22.9 % / 13.3 % queue; ACI pulls that
+   down to 94.9 % / 94.4 % — nominal rather than above it — and shrinks the queue to 13.8 % (−9.1 %p)
+   and 11.0 % (−2.3 %p). The gain here is review capacity, not coverage. It is also noisier by
+   construction: ULB's test block holds roughly a hundred frauds, so the newer half reads 91.8 % for
+   both boosters, and at `alpha = 0.03` XGBoost's level drifted up enough to add 2.1 %p of queue without
+   moving coverage at all (95.7 % either way) — the label-scarce failure mode listed under
+   [Limitations](#limitations-and-future-work).
+4. **The pooled threshold does not recover, in either regime.** `standard` CP holds marginal coverage at
+   94.7 % – 96.1 % while covering 20.6 % – 21.8 % of fraud on IEEE-CIS and 0.0 % – 0.27 % on ULB, with a
+   triage rate of exactly zero: the set collapses to `{}` or `{0}`, so there is nothing for a reviewer to
+   look at. The ladder the repository claims is therefore visible end to end on the same score — pooled
+   split ≪ Mondrian ≲ ACI.
+
+**Reproducibility note.** Both runs were executed on the machine that owns the data (the datasets are
+not redistributed here) and their summary CSVs are the provenance of the tables above; as with stage 2,
+`results/` stays gitignored and the numbers are regenerated by the two commands in this section. One
+difference from the stage-2 runs is worth stating: without a calibrator there is no `prob_cal` carve-out,
+so the stage-3 boosters train on the full 60 % training block instead of 85 % of it. That is why the
+static Mondrian row here (90.5 % / 92.4 % on IEEE-CIS) sits a few tenths away from the ablation run's
+91.1 % / 92.1 %: same protocol and seeds, slightly larger fit block.
+
+The *mechanism* is also pinned by tests, independently of the data: `tests/test_stage3_aci.py` runs a
+synthetic stream whose fraud scores decay over time and asserts that static Mondrian coverage falls to
+84 – 92 % at `alpha = 0.05` while the adaptive scheme recovers to at least 93 % on every seed, with the
+legitimate level staying within two points of nominal so the review queue is not widened for a class
+that did not drift.
 
 ## Evaluation Metrics
 
@@ -603,7 +681,8 @@ results/<dataset>/
 ├── run_metadata.json                # config, split sizes, prevalence, calibrator fits, timestamp, elapsed
 └── figures/
     ├── <dataset>_<model>_alpha_tradeoff.png       # stage 1: scheme comparison
-    └── <dataset>_<model>_ablation_tradeoff.png    # stage 2: one line per variant
+    ├── <dataset>_<model>_ablation_tradeoff.png    # stage 2: one line per variant
+    └── <dataset>_<model>_stage3_methods.png       # stage 3: static vs adaptive, both halves
 ```
 
 The metric CSVs are prefixed with the dataset name (`ulb_summary_metrics.csv`,
