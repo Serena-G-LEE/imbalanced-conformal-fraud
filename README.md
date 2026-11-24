@@ -127,6 +127,7 @@ imbalanced-conformal-fraud
 │   └── test_data.py             # temporal split arithmetic, chronological ordering
 ├── run_experiment.py            # CLI: models × seeds × methods × alphas -> CSVs + figures
 ├── requirements.txt
+├── CONTRIBUTING.md              # branching strategy, commit conventions, reproducibility rules
 └── README.md
 ```
 
@@ -298,6 +299,15 @@ pandas is absent.
   the quantity to monitor, and it is reported per class at every `alpha`. The guarantee should be read
   as the design target rather than an unconditional promise under drift — a known tension in the
   time-series CP literature and the natural next extension of this work.
+
+## Branching Strategy
+
+`main` keeps only verified states. Features and experiments are developed on short-lived branches
+(`feat/<scope>`, `exp/<dataset>-<study>`) and merged with `--no-ff`, so each change is revertible as a
+unit (`git revert -m 1 <merge-commit>`). Dataset-specific experiments branch from `main` as
+`exp/ulb-baseline` and `exp/ieee-cis`, carrying only config overrides and result summaries — data and raw
+outputs stay out of version control. Full rules, including commit conventions, are in
+[`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Limitations and Future Work
 
