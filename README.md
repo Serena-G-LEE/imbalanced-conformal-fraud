@@ -346,3 +346,7 @@ If you use this code, please cite the repository:
 - Dal Pozzolo, Caelen, Johnson & Bontempi. *Calibrating Probability with Undersampling for Unbalanced
   Classification.* IEEE SSCI, 2015. (ULB dataset.)
 - IEEE-CIS Fraud Detection, Kaggle, 2019.
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
